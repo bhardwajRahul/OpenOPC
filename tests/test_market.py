@@ -245,6 +245,16 @@ class TestSandboxChecker:
         report = checker.validate(package)
         assert report.passed is False
 
+    def test_traversal_id_errors(self):
+        """A package id used as a path component must not allow path traversal."""
+        package = OPCPackage(
+            manifest=OPCPackageManifest(id="../../projects/victim", name="Evil"),
+        )
+        checker = SandboxChecker()
+        report = checker.validate(package)
+        assert report.passed is False
+        assert any("id" in e for e in report.errors)
+
 
 # ---------------------------------------------------------------------------
 # Loader Tests
@@ -355,6 +365,25 @@ class TestPackageLoader:
         assert len(config.org.installed_packages) == 0
         assert not (opc_home / "prompts" / "market" / "test-pkg").exists()
         assert not (opc_home / "prompts" / "talent" / "test-pkg:analyst-tmpl.md").exists()
+
+    @pytest.mark.parametrize("bad_id", ["../../projects/victim", "..", "/etc", "a/b", "UPPER", "a b"])
+    def test_write_prompts_rejects_traversal_id(self, tmp_path: Path, bad_id: str):
+        """A traversal/malformed package id must not escape the market directory."""
+        opc_home = tmp_path / ".opc"
+        opc_home.mkdir(exist_ok=True)
+        loader = PackageLoader(OPCConfig(), opc_home)
+        with pytest.raises(ValueError):
+            loader._write_prompts(bad_id, {"analyst.md": "payload"})
+        # Nothing was written outside the market tree.
+        assert not (tmp_path / "projects").exists()
+
+    def test_uninstall_rejects_traversal_id(self, tmp_path: Path):
+        """uninstall() must refuse to rmtree a traversed path."""
+        opc_home = tmp_path / ".opc"
+        opc_home.mkdir(exist_ok=True)
+        loader = PackageLoader(OPCConfig(), opc_home)
+        with pytest.raises(ValueError):
+            loader.uninstall("../../projects/victim")
 
     def test_uninstall_removes_org_assets_without_runtime_topology(self, tmp_path: Path):
         """Uninstall removes org assets; runtime topology cleanup is no longer part of packages."""

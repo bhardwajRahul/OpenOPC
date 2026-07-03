@@ -154,8 +154,17 @@ class PackageExporter:
             refs.update(e.get("prompt_refs") or [])
 
         contents: dict[str, str] = {}
+        # ``refs`` come from package/role definitions as bare strings. An absolute or
+        # traversing value (e.g. "/etc/passwd" or "../../.aws/credentials") must not be
+        # bundled into the exported package, so confine each path to opc_home.
+        base = self.opc_home.resolve()
         for ref in sorted(refs):
-            path = self.opc_home / ref
+            path = (self.opc_home / ref).resolve()
+            try:
+                path.relative_to(base)
+            except ValueError:
+                logger.debug("Skipping prompt ref outside opc_home: %s", ref)
+                continue
             if path.is_file():
                 try:
                     contents[path.name] = path.read_text(encoding="utf-8")

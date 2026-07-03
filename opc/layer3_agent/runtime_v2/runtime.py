@@ -1575,6 +1575,20 @@ class NativeRuntimeV2:
                 except json.JSONDecodeError as exc:
                     parsed_arguments = raw_arguments
                     parse_error = f"Invalid tool arguments JSON for `{item.get('function', '')}`: {exc}"
+            # Valid JSON that is not an object (e.g. ``[...]`` or ``"x"``) must surface as a
+            # parse error too. Otherwise downstream code sees an empty ``arguments`` dict and
+            # a falsy ``arguments_parse_error``, executing the tool with no arguments (which
+            # can silently wipe state, e.g. todo_write receiving an empty list). Keep the more
+            # specific JSONDecodeError message when parsing itself failed.
+            if (
+                raw_arguments.strip()
+                and parse_error is None
+                and not isinstance(parsed_arguments, dict)
+            ):
+                parse_error = (
+                    f"Tool arguments for `{item.get('function', '')}` must be a JSON object; "
+                    f"got {type(parsed_arguments).__name__}."
+                )
             finalized.append({
                 "id": item.get("id") or f"tool_{index}",
                 "function": item.get("function") or "",

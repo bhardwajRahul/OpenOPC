@@ -118,7 +118,12 @@ async def _run_shell_command(
         if active_prefix and active_prefix not in command:
             separator = _POWERSHELL_CMD_SEPARATOR if is_powershell else _BASH_CMD_SEPARATOR
             command = f"{active_prefix}{separator}{command}"
-            args = [args[0], args[1], command] if len(args) >= 2 else args
+            # Replace only the trailing command argument. PowerShell args are
+            # [exe, "-NoProfile", "-Command", command] (4 elements); the previous
+            # ``[args[0], args[1], command]`` dropped the "-Command" flag and left
+            # PowerShell unable to interpret the prefixed command. Bash args are
+            # [bash, "-lc", command] (3 elements), handled identically here.
+            args = [*args[:-1], command] if len(args) >= 1 else args
     context = resolve_task_execution_context(task)
     if resolved_cwd and not context.get("workspace_root"):
         context["workspace_root"] = resolved_cwd

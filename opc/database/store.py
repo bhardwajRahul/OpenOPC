@@ -113,7 +113,13 @@ def _json_dumps(value: Any) -> str:
 def _json_loads(value: str | None, default: Any) -> Any:
     if not value:
         return default
-    return json.loads(value)
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        # JSON columns can hold corrupt/partial values after a crash or manual edit.
+        # Raising here would abort store.initialize() (e.g. via _sweep_stale_claims) and
+        # prevent the store from ever opening, so fall back to the default instead.
+        return default
 
 
 class _SQLiteCursorAdapter:
