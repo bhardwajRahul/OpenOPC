@@ -86,6 +86,33 @@ def _normalized_model_name(model: str) -> str:
 # enough for modern models so compaction still has a real denominator.
 _CONTEXT_WINDOW_FALLBACK = 128_000
 _context_window_fallback_warned: set[str] = set()
+_max_tokens_clamp_warned: set[str] = set()
+
+
+def _clamp_max_tokens(model: str, requested: int) -> int:
+    """Cap the requested output tokens at the model's known output limit.
+
+    Providers disagree on how to handle an oversized max_tokens: some clamp
+    silently, others (e.g. DeepSeek) reject the request outright. Clamping
+    here keeps a generous config default (32768) safe on small-cap models.
+    Unknown models pass through unchanged.
+    """
+    try:
+        info = litellm.get_model_info(model)
+        cap = info.get("max_output_tokens") or info.get("max_tokens")
+    except Exception:
+        return requested
+    if not cap or requested <= int(cap):
+        return requested
+    if model not in _max_tokens_clamp_warned:
+        _max_tokens_clamp_warned.add(model)
+        logger.info(
+            "max_tokens {} exceeds output limit {} of model={}; clamping.",
+            requested,
+            cap,
+            model,
+        )
+    return int(cap)
 
 
 _CONTEXT_WINDOW_OVERRIDES: tuple[tuple[str, int], ...] = (
@@ -485,7 +512,7 @@ class LLMProvider:
     ) -> dict[str, Any]:
         model = self._select_model(task_type)
         temp = temperature if temperature is not None else self.config.temperature
-        max_tok = max_tokens if max_tokens is not None else self.config.max_tokens
+        max_tok = _clamp_max_tokens(model, max_tokens if max_tokens is not None else self.config.max_tokens)
 
         call_kwargs: dict[str, Any] = {
             "model": model,
@@ -630,7 +657,7 @@ class LLMProvider:
     ) -> AsyncIterator[RuntimeLLMEvent]:
         model = self._select_model(task_type)
         temp = temperature if temperature is not None else self.config.temperature
-        max_tok = max_tokens if max_tokens is not None else self.config.max_tokens
+        max_tok = _clamp_max_tokens(model, max_tokens if max_tokens is not None else self.config.max_tokens)
 
         call_kwargs: dict[str, Any] = {
             "model": model,
