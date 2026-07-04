@@ -109,7 +109,13 @@ class ChannelManager:
             message = await self.bus.get_response(timeout=1.0)
             if message is None:
                 continue
-            await self.dispatch_outbound(message)
+            # A single failing send (network reset, malformed chat id, etc.) must not
+            # terminate this loop — it is the only outbound consumer for every channel,
+            # so one exception would silently stop all message delivery until restart.
+            try:
+                await self.dispatch_outbound(message)
+            except Exception as exc:  # noqa: BLE001 - resilience of the dispatch loop
+                logger.exception("Failed to dispatch outbound message: {}", exc)
 
     async def dispatch_outbound(self, message: SystemMessage) -> None:
         channel_name = message.channel or self.config.system.default_channel

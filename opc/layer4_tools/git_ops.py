@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from typing import Any
 
 from opc.layer4_tools.shell import shell_exec
@@ -16,7 +17,11 @@ async def git_commit(message: str, working_directory: str = ".", add_all: bool =
     cmds = []
     if add_all:
         cmds.append("git add -A")
-    cmds.append(f'git commit -m "{message}"')
+    # The message flows through ``shell_exec`` -> ``bash -lc "<command>"``, so it is
+    # shell-interpolated. Quote it to prevent a crafted message (e.g.
+    # ``foo" && rm -rf / #``) from injecting arbitrary commands. Only the literal
+    # commit message must reach ``git commit``.
+    cmds.append(f"git commit -m {shlex.quote(str(message))}")
     return await shell_exec(" && ".join(cmds), working_directory=working_directory)
 
 
@@ -26,7 +31,9 @@ async def git_diff(working_directory: str = ".", staged: bool = False) -> dict[s
 
 
 async def git_clone(url: str, directory: str = ".") -> dict[str, Any]:
-    return await shell_exec(f"git clone {url}", working_directory=directory, timeout=300)
+    # Quote the URL: it is interpolated into a ``bash -lc`` command and a value like
+    # ``https://x.git; rm -rf /`` or ``$(curl ...)`` would otherwise be executed.
+    return await shell_exec(f"git clone {shlex.quote(str(url))}", working_directory=directory, timeout=300)
 
 
 def create_git_tools() -> list[ToolDefinition]:

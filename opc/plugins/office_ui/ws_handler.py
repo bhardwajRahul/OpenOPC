@@ -3131,6 +3131,11 @@ class WSHandler:
             data = json.loads(raw)
         except json.JSONDecodeError:
             return
+        # ``json.loads`` succeeds for non-object frames (null/number/array/string);
+        # ``data.get`` would then raise AttributeError, escape this method, and drop the
+        # whole WS connection. Ignore anything that is not a JSON object.
+        if not isinstance(data, dict):
+            return
 
         msg_type = data.get("type", "")
         if self._shutting_down:
@@ -3667,8 +3672,16 @@ class WSHandler:
         """Write a custom prompt file and return its relative path as a prompt_ref."""
         prompts_dir = Path(self.engine.opc_home) / "prompts" / "custom"
         prompts_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{employee_id}.md"
-        filepath = prompts_dir / filename
+        # ``employee_id`` is derived from user-supplied role id/name and previously flowed
+        # unchecked into the path, enabling traversal (e.g. "../../tmp/pwn"). Reduce it to
+        # a single safe path component and confirm containment before writing.
+        safe_id = Path(str(employee_id or "")).name.replace("..", "")
+        safe_id = safe_id.replace("/", "").replace("\\", "").strip() or "agent"
+        filename = f"{safe_id}.md"
+        filepath = (prompts_dir / filename).resolve()
+        base = prompts_dir.resolve()
+        if base not in filepath.parents and filepath != base:
+            raise ValueError(f"Custom prompt filename escapes prompts directory: {employee_id!r}")
         filepath.write_text(f"# {name}\n\n{prompt_text}\n", encoding="utf-8")
         return f"prompts/custom/{filename}"
 

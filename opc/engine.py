@@ -11491,9 +11491,12 @@ class OPCEngine:
 
     def _parse_reorg_payload(self, payload: str) -> dict[str, Any] | None:
         try:
-            return json.loads(payload)
+            data = json.loads(payload)
         except Exception:
             return None
+        # ``json.loads`` accepts any JSON type; callers do ``parsed.get(...)`` and crash
+        # (AttributeError) on a non-dict value such as ``reorg propose 42`` or ``[1,2]``.
+        return data if isinstance(data, dict) else None
 
     async def _save_reorg_checkpoint(self, proposal: ReorgProposal) -> None:
         await self._save_execution_checkpoint(

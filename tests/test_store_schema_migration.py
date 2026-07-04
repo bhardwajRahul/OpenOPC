@@ -538,5 +538,18 @@ class TestOPCStoreSchemaMigration(unittest.IsolatedAsyncioTestCase):
                 await store.close()
 
 
+class TestJsonLoadsFallback(unittest.TestCase):
+    def test_corrupt_json_returns_default(self):
+        from opc.database.store import _json_loads
+
+        # Corrupt/partial JSON in a persisted column must not raise — it is read during
+        # store.initialize() (via _sweep_stale_claims) and a JSONDecodeError there would
+        # prevent the store from ever opening.
+        self.assertEqual(_json_loads(None, {}), {})
+        self.assertEqual(_json_loads("", {}), {})
+        self.assertEqual(_json_loads("{not json", {}), {})
+        self.assertEqual(_json_loads('{"a": 1}', {}), {"a": 1})
+
+
 if __name__ == "__main__":
     unittest.main()

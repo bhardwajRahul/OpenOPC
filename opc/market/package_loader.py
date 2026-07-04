@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n.*?\n---\s*\n?", re.DOTALL)
+# A package id doubles as a directory name under prompts/market, so it must be a safe
+# path component (no separators, no "..", no traversal). Mirrors sandbox_checker.
+_PACKAGE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 
 class PackageLoader:
@@ -227,6 +230,10 @@ class PackageLoader:
 
         Caller must call config.save() to persist.
         """
+        # Validate up front: package_id is used to locate a directory that is later
+        # removed with shutil.rmtree, so a traversal value must be rejected before any
+        # lookup — even for ids that are not currently installed.
+        self._market_prompts_dir(package_id)
         # Find the installed package record
         installed = None
         for pkg in self.config.org.installed_packages:
@@ -267,7 +274,7 @@ class PackageLoader:
         ]
 
         # Remove prompt files
-        prompts_dir = self.opc_home / "prompts" / "market" / package_id
+        prompts_dir = self._market_prompts_dir(package_id)
         if prompts_dir.exists():
             shutil.rmtree(prompts_dir, ignore_errors=True)
 
@@ -282,11 +289,37 @@ class PackageLoader:
         """Write prompt files to {opc_home}/prompts/market/{package_id}/."""
         if not prompt_contents:
             return
-        target_dir = self.opc_home / "prompts" / "market" / package_id
+        target_dir = self._market_prompts_dir(package_id)
         target_dir.mkdir(parents=True, exist_ok=True)
+        # ``prompt_contents`` keys are filenames supplied by the package; confine each
+        # written file to target_dir so a crafted name (e.g. "../escape.md") cannot
+        # escape via Path traversal.
+        base = target_dir.resolve()
         for filename, content in prompt_contents.items():
-            with open(target_dir / filename, "w", encoding="utf-8") as f:
+            dest = (target_dir / filename)
+            if base not in dest.resolve().parents and dest.resolve() != base:
+                raise ValueError(f"Prompt filename escapes package directory: {filename!r}")
+            with open(dest, "w", encoding="utf-8") as f:
                 f.write(content)
+
+    def _market_prompts_dir(self, package_id: str) -> Path:
+        """Resolve ``{opc_home}/prompts/market/{package_id}`` with validation.
+
+        ``package_id`` originates from an untrusted package manifest and is used both to
+        write files (``_write_prompts``) and to recursively delete a directory
+        (``uninstall``). Without validation a value such as ``../../projects/<victim>``
+        traverses out of the market tree and yields arbitrary file write or arbitrary
+        directory deletion. Reject ids that are not lowercase alphanumeric (hyphens/
+        underscores allowed) and confirm the resolved path stays inside the market base.
+        """
+        normalized = str(package_id or "").strip()
+        if not _PACKAGE_ID_RE.match(normalized):
+            raise ValueError(f"Invalid package id: {package_id!r}")
+        market_base = (self.opc_home / "prompts" / "market").resolve()
+        target = (market_base / normalized).resolve()
+        if target != market_base and market_base not in target.parents:
+            raise ValueError(f"Package id escapes market directory: {package_id!r}")
+        return self.opc_home / "prompts" / "market" / normalized
 
     def _current_talent_template_ids(self) -> set[str]:
         try:

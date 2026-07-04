@@ -66,6 +66,10 @@ class SandboxChecker:
         if not m.name:
             report.errors.append("Package manifest missing 'name'")
         if m.id and not re.match(r"^[a-z0-9][a-z0-9_-]*$", m.id):
-            report.warnings.append(
-                f"Package id '{m.id}' should be lowercase alphanumeric with hyphens/underscores"
+            # The id is used as a directory name under prompts/market and is passed to
+            # ``shutil.rmtree`` on uninstall. A malformed value enables path traversal
+            # (arbitrary file write / directory deletion), so this must be a hard error,
+            # not a warning.
+            report.errors.append(
+                f"Package id '{m.id}' must be lowercase alphanumeric with hyphens/underscores"
             )
