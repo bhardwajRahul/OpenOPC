@@ -435,8 +435,13 @@ class NativeRuntimeV2:
                                     "canonical_turn_id": conversation_turn_id,
                                     "conversation_turn_id": conversation_turn_id,
                                     "execution_turn_id": execution_turn_id,
-                                    "item_id": f"{turn_id}:thinking",
-                                    "stream_id": f"{turn_id}:thinking",
+                                    # Keyed per iteration (like assistant_delta):
+                                    # thinking_delta_seq resets every iteration, so a
+                                    # turn-scoped stream id makes downstream seq guards
+                                    # drop iteration>=2 deltas and collapses all
+                                    # iterations into one entry (no tool interleaving).
+                                    "item_id": f"{execution_turn_id}:thinking",
+                                    "stream_id": f"{execution_turn_id}:thinking",
                                     "seq": thinking_delta_seq,
                                     "text": thinking_text,
                                 },
@@ -2797,6 +2802,11 @@ class NativeRuntimeV2:
         if is_company_mode:
             metadata["execution_mode"] = "company_mode"
             metadata["company_runtime_raw_turn"] = True
+            if not tool_calls:
+                # Terminal iteration of the company turn — this is the role's
+                # final reply. Marked so the UI can show it at summary detail
+                # even though the kind is otherwise full-detail-only.
+                metadata["company_final_turn"] = True
             if task.assigned_to:
                 metadata["role_id"] = str(task.assigned_to)
         else:
@@ -2808,7 +2818,15 @@ class NativeRuntimeV2:
             if message_turn_id and message_turn_id != canonical_turn_id:
                 metadata["execution_turn_id"] = message_turn_id
             if is_company_mode:
-                metadata["ui_message_id"] = f"runtime-v2-company-assistant:{canonical_turn_id}"
+                # Tool-calling iterations of a company conversation turn share
+                # one UI row; the terminal reply gets its own id. The id-keyed
+                # backfill merge keeps the first-inserted content for same-kind
+                # candidates, so reusing the shared id freezes the row at
+                # iteration 1 and swallows the final reply entirely.
+                if metadata.get("company_final_turn"):
+                    metadata["ui_message_id"] = f"runtime-v2-company-assistant-final:{canonical_turn_id}"
+                else:
+                    metadata["ui_message_id"] = f"runtime-v2-company-assistant:{canonical_turn_id}"
             elif is_intermediate_tool_turn:
                 metadata["ui_message_id"] = f"runtime-v2-intermediate-assistant:{message_turn_id or canonical_turn_id}"
             else:

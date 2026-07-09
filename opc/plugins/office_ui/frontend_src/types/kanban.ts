@@ -215,7 +215,7 @@ export interface KanbanTask {
 // ── Progress Entry (per-task activity log) ──────────────────────────────────
 
 export type ProgressEntryType =
-  | 'thinking' | 'tool_call' | 'autonomy' | 'handoff' | 'gate_result' | 'status_change'
+  | 'thinking' | 'assistant' | 'tool_call' | 'autonomy' | 'handoff' | 'gate_result' | 'status_change'
   | 'work_item_started' | 'gate_approved' | 'gate_rejected'
   | 'awaiting_manager_review' | 'awaiting_human' | 'awaiting_review' | 'awaiting_peer'
   | 'work_item_failed' | 'deadlock' | 'needs_input' | 'verification'

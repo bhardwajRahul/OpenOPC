@@ -1599,6 +1599,58 @@ class ChatStore:
     # concern, swap this in-row JSON blob for a proper rolling table.
     _PROGRESS_MAX_ENTRIES = 1000
 
+    # Streaming text types arrive as one entry per token-sized delta. Without
+    # folding, thinking floods the entry cap (forensics: 929/1000 entries were
+    # single-token thinking rows) and evicts the interleaved tool history.
+    _PROGRESS_STREAM_MERGE_TYPES = frozenset({"thinking", "assistant"})
+
+    @staticmethod
+    def _progress_stream_key(entry: dict[str, Any]) -> tuple[str, str, str] | None:
+        entry_type = str(entry.get("type", "") or "")
+        if entry_type not in ChatStore._PROGRESS_STREAM_MERGE_TYPES:
+            return None
+        item_id = str(entry.get("item_id") or entry.get("stream_id") or "").strip()
+        if not item_id:
+            return None
+        return (entry_type, str(entry.get("turn_id", "") or ""), item_id)
+
+    @classmethod
+    def _fold_progress_entries(
+        cls,
+        existing: list[dict[str, Any]],
+        new_entries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Fold streaming deltas into their stream's entry (mirrors the
+        frontend ``appendProgressEntry`` merge so persisted state equals what
+        the live client built)."""
+        merged = list(existing)
+        index_by_key: dict[tuple[str, str, str], int] = {}
+        for i, entry in enumerate(merged):
+            key = cls._progress_stream_key(entry)
+            if key is not None:
+                index_by_key[key] = i
+        for entry in new_entries:
+            key = cls._progress_stream_key(entry)
+            if key is None or key not in index_by_key:
+                if key is not None:
+                    index_by_key[key] = len(merged)
+                merged.append(entry)
+                continue
+            target = merged[index_by_key[key]]
+            last_seq = target.get("seq")
+            new_seq = entry.get("seq")
+            if isinstance(last_seq, (int, float)) and isinstance(new_seq, (int, float)) and new_seq <= last_seq:
+                continue
+            # Deltas are disjoint token fragments — concatenate raw, no strip.
+            detail = f"{target.get('detail') or ''}{entry.get('detail') or ''}"
+            preview = " ".join(detail.split())
+            folded = dict(target)
+            folded.update(entry)
+            folded["detail"] = detail
+            folded["summary"] = preview[:120].rstrip() + ("..." if len(preview) > 120 else "")
+            merged[index_by_key[key]] = folded
+        return merged
+
     async def append_progress(
         self,
         task_id: str,
@@ -1611,7 +1663,7 @@ class ChatStore:
         the first call creates the row and subsequent calls update it.
         """
         existing = await self.get_progress(task_id, project_id=project_id)
-        merged = (existing + new_entries)[-self._PROGRESS_MAX_ENTRIES:]
+        merged = self._fold_progress_entries(existing, new_entries)[-self._PROGRESS_MAX_ENTRIES:]
 
         async def _write() -> None:
             await self._db.execute(

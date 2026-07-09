@@ -230,6 +230,11 @@ def _transcript_message_hidden_from_ui(
 ) -> bool:
     metadata = dict(getattr(message, "metadata", {}) or {})
     kind = str(metadata.get("kind", "") or "").strip()
+    if metadata.get("company_final_turn"):
+        # The role's final reply of a company turn is the user-visible result
+        # (intake/aggregate turns have no engine-recorded result surface, so
+        # hiding this would drop the reply from the chat entirely).
+        return False
     return detail_level != "full" and kind in _FULL_DETAIL_ONLY_TRANSCRIPT_KINDS
 
 
@@ -1122,7 +1127,11 @@ def _transcript_item_to_ui_message(
             "role": role,
             "task_id": task_id,
             "transcript_kind": kind,
-            "detail_visibility": _transcript_message_visibility(kind),
+            "detail_visibility": (
+                "summary"
+                if message_metadata.get("company_final_turn")
+                else _transcript_message_visibility(kind)
+            ),
             **({"type": "system"} if kind == "runtime_v2_user_turn" else {}),
             **({"verification_verdict": verification_footer} if verification_footer else {}),
             **({"runtime_thinking": runtime_thinking} if runtime_thinking else {}),

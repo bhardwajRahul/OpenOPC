@@ -18,6 +18,7 @@ export const INLINE_PROGRESS_ENTRY_TYPES = new Set<ProgressEntryType>(['thinking
 
 const ENTRY_CONFIG: Record<ProgressEntryType, { icon: React.ReactNode; color: string; label: string }> = {
   thinking:      { icon: <IconBrain />,       color: 'var(--accent)',          label: 'Thinking' },
+  assistant:     { icon: <IconSparkle />,     color: 'var(--accent)',          label: 'Reply' },
   tool_call:     { icon: <IconTool />,        color: 'var(--green)',           label: 'Tool' },
   autonomy:      { icon: <IconShield />,      color: 'var(--yellow)',          label: 'Autonomy' },
   handoff:       { icon: <IconArrowRight />,  color: 'var(--accent)',          label: 'Handoff' },
@@ -257,7 +258,7 @@ export const AgentProgressEntryCard = React.memo(function AgentProgressEntryCard
     )
   }
 
-  if (entry.type === 'thinking') {
+  if (entry.type === 'thinking' || entry.type === 'assistant') {
     return (
       <div className="ptl-tool-card">
         <button

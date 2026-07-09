@@ -68,7 +68,7 @@ function canMergeProgress(left: ProgressEntry, right: ProgressEntry): boolean {
   if (leftKey && rightKey) return leftKey === rightKey
   if (right.timestamp - left.timestamp > STREAM_MERGE_WINDOW_MS) return false
   if (left.type !== right.type) return false
-  if (left.type === 'thinking') return true
+  if (left.type === 'thinking' || left.type === 'assistant') return true
   if (left.type === 'tool_call') return left.summary === right.summary
   return false
 }
@@ -83,14 +83,15 @@ function isDuplicateProgress(left: ProgressEntry, right: ProgressEntry): boolean
 }
 
 function mergeProgress(left: ProgressEntry, right: ProgressEntry): ProgressEntry {
-  if (left.type === 'thinking') {
+  if (left.type === 'thinking' || left.type === 'assistant') {
     // Merge detail text only: summary is a label/preview ("Thinking",
     // truncated excerpt), so falling back to it would splice label text
-    // into the middle of the merged thinking stream.
+    // into the middle of the merged stream. Assistant reply streams merge
+    // the same way as thinking streams.
     const detail = mergeText(left.detail ?? '', right.detail ?? '', 'thinking')
     return {
       timestamp: right.timestamp,
-      type: 'thinking',
+      type: left.type,
       summary: summarizeThinking(detail, right.summary || left.summary),
       detail: detail || undefined,
       turnId: right.turnId ?? left.turnId,
@@ -136,8 +137,12 @@ export function appendProgressEntry(
   const actualIndex = targetIndex >= 0 ? log.length - 1 - targetIndex : log.length - 1
   const last = log[actualIndex]
   if (!last) return [normalized]
+  // The seq guard only applies within the SAME stream: when the key was not
+  // found, `last` is an unrelated entry and a fresh stream legitimately
+  // restarts at seq 1 (per-iteration thinking/assistant streams).
   if (
     normalizedKey
+    && targetIndex >= 0
     && typeof last.seq === 'number'
     && typeof normalized.seq === 'number'
     && normalized.seq <= last.seq

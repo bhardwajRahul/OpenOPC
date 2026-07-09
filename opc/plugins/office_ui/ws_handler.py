@@ -1691,6 +1691,12 @@ class WSHandler:
             return
         entry["timestamp"] = time.time()
         _add_execution_turn_aliases(entry, raw_task_id)
+        # Buffer BEFORE broadcasting: broadcast awaits can interleave a
+        # session_detail read, and any entry a client has already seen must be
+        # visible in buffer∪DB or the snapshot will erase it from the live log.
+        buf = self._progress_buffer.setdefault(task_id, [])
+        buf.append(entry)
+        self._progress_project_ids[task_id] = pid
         await self.broadcast({
             "type": "session_progress",
                 "payload": {
@@ -1711,10 +1717,9 @@ class WSHandler:
                     "entry": entry,
                 },
             })
-        buf = self._progress_buffer.setdefault(task_id, [])
-        buf.append(entry)
-        self._progress_project_ids[task_id] = pid
-        if len(buf) >= self._PROGRESS_FLUSH_THRESHOLD:
+        # Re-read the buffer: a concurrent flush during the broadcast awaits
+        # may have popped it, leaving `buf` as a stale detached list.
+        if len(self._progress_buffer.get(task_id, [])) >= self._PROGRESS_FLUSH_THRESHOLD:
             await self._flush_progress(task_id, project_id=pid)
         if runtime_type in {"turn_completed", "turn_failed", "checkpoint_saved"}:
             await self._sync_task_transcript_messages(task_id, engine=runtime_engine)
@@ -2213,6 +2218,11 @@ class WSHandler:
                     if not entry.get("work_item_projection_title"):
                         entry["work_item_projection_title"] = _role_label or None
                 _add_execution_turn_aliases(entry, raw_task_id or task_id)
+                # Buffer BEFORE broadcasting: broadcast awaits can interleave a
+                # session_detail read, and any entry a client has already seen
+                # must be visible in buffer∪DB or the snapshot will erase it.
+                self._progress_buffer.setdefault(task_id, []).append(entry)
+                self._progress_project_ids[task_id] = pid
                 await self.broadcast({"type": "session_progress", "payload": {
                     "project_id": pid,
                     "task_id": task_id,
@@ -2229,11 +2239,9 @@ class WSHandler:
                         "entry": entry,
                     }})
 
-                # ── Accumulate for persistence (flushed at threshold / task end) ──
-                buf = self._progress_buffer.setdefault(task_id, [])
-                buf.append(entry)
-                self._progress_project_ids[task_id] = pid
-                if len(buf) >= self._PROGRESS_FLUSH_THRESHOLD:
+                # ── Persist at threshold (re-read: a concurrent flush during the
+                # broadcast awaits may have popped the buffer) ──
+                if len(self._progress_buffer.get(task_id, [])) >= self._PROGRESS_FLUSH_THRESHOLD:
                     await self._flush_progress(task_id, project_id=pid)
 
         is_work_item_event = text.startswith("[Company:")
@@ -2651,7 +2659,16 @@ class WSHandler:
             entry_type = "work_item_started"
             summary = f"Turn {payload.get('iteration', '?')} started"
         elif runtime_type == "assistant_delta":
-            return None
+            # Company mode only (task mode is filtered out above and already
+            # streams assistant text as the draft reply): surface the role's
+            # narration and final reply in its progress transcript, matching
+            # what external agents get via [External:*:result] parsing.
+            entry_type = "assistant"
+            detail = str(payload.get("text", "") or "")
+            if not detail.strip():
+                return None
+            preview = " ".join(detail.split())
+            summary = preview[:120].rstrip() + ("..." if len(preview) > 120 else "")
         elif runtime_type == "member_idle":
             return None
         elif runtime_type == "thinking_delta":
@@ -5613,6 +5630,11 @@ class WSHandler:
         }
         if "progress" in include_set or "work_items" in include_set or detail_level == "full":
             try:
+                # Flush the in-memory progress buffer first: entries are
+                # broadcast to clients before they reach the DB, so a snapshot
+                # built from the DB alone would erase freshly streamed entries
+                # from the client's live log (visible as flickering rows).
+                await self._flush_progress(task_id, project_id=project_id)
                 progress_log = await self.chat_store.get_progress(task_id, project_id=project_id)
             except Exception:
                 progress_log = []

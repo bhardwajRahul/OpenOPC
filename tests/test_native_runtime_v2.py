@@ -409,8 +409,30 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["execution_mode"], "company_mode")
         self.assertTrue(metadata["company_runtime_raw_turn"])
         self.assertEqual(metadata["role_id"], "chao")
-        self.assertEqual(metadata["ui_message_id"], "runtime-v2-company-assistant:ui-turn:company")
+        # No tool calls ⇒ terminal iteration: flagged as the role's final
+        # reply and given its own UI row id so the id-keyed backfill merge
+        # cannot swallow it into the frozen shared-iteration row.
+        self.assertTrue(metadata["company_final_turn"])
+        self.assertEqual(metadata["ui_message_id"], "runtime-v2-company-assistant-final:ui-turn:company")
         self.assertNotIn("visible_speaker", metadata)
+
+        await runtime._persist_assistant_turn(
+            task,
+            "中间轮叙述",
+            [{"id": "call-1", "function": "file_read", "arguments": {}}],
+            runtime_session_id="rt_company",
+            turn_id="ui-turn:company:iter:1",
+            conversation_turn_id="ui-turn:company",
+            iteration=1,
+        )
+
+        intermediate_metadata = memory.appended_messages[-1]["kwargs"]["metadata"]
+        self.assertEqual(intermediate_metadata["kind"], "runtime_v2_company_assistant")
+        self.assertNotIn("company_final_turn", intermediate_metadata)
+        self.assertEqual(
+            intermediate_metadata["ui_message_id"],
+            "runtime-v2-company-assistant:ui-turn:company",
+        )
 
     async def test_task_mode_assistant_turn_with_company_defaults_stays_opc_task_reply(self) -> None:
         memory = _StubMemoryManager(_StubStore())

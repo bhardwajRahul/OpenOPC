@@ -114,3 +114,38 @@ permissionLog = appendProgressEntry(permissionLog, {
 
 assert.equal(permissionLog.length, 1)
 assert.equal(permissionLog[0]?.summary, 'shell_exec: allow')
+
+// Native company assistant replies stream like thinking: same-stream deltas
+// accumulate into one entry instead of replacing each other, and separate
+// iterations (distinct item_id) stay separate entries.
+let assistantLog = appendProgressEntry([], {
+  timestamp: 30,
+  type: 'assistant',
+  summary: '文件已成功写入',
+  detail: '文件已成功写入',
+  turnId: 'rt-1:4',
+  itemId: 'rt-1:4:iter:2:assistant',
+  seq: 1,
+})
+assistantLog = appendProgressEntry(assistantLog, {
+  timestamp: 31,
+  type: 'assistant',
+  summary: '(278 行)。',
+  detail: '(278 行)。',
+  turnId: 'rt-1:4',
+  itemId: 'rt-1:4:iter:2:assistant',
+  seq: 2,
+})
+assistantLog = appendProgressEntry(assistantLog, {
+  timestamp: 32,
+  type: 'assistant',
+  summary: '采集完成报告',
+  detail: '采集完成报告',
+  turnId: 'rt-1:4',
+  itemId: 'rt-1:4:iter:3:assistant',
+  seq: 1,
+})
+assert.equal(assistantLog.length, 2)
+assert.equal(assistantLog[0]?.detail, '文件已成功写入(278 行)。')
+assert.equal(assistantLog[0]?.summary, '文件已成功写入(278 行)。')
+assert.equal(assistantLog[1]?.detail, '采集完成报告')

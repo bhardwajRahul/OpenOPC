@@ -80,9 +80,32 @@ class WSHandlerProgressParsingTests(unittest.TestCase):
 
         self.assertIsNone(entry)
 
-    def test_runtime_assistant_delta_is_not_recorded_as_progress_entry(self) -> None:
+    def test_company_assistant_delta_becomes_assistant_progress_entry(self) -> None:
+        # Company mode surfaces the role's narration/final reply in its
+        # progress transcript (parity with external agents' [External:*:result]).
         entry = WSHandler._runtime_event_to_progress_entry(
-            {"type": "assistant_delta", "text": "final answer token"},
+            {
+                "type": "assistant_delta",
+                "text": "final answer token",
+                "execution_mode": "company_mode",
+            },
+        )
+
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry["type"], "assistant")
+        self.assertEqual(entry["summary"], "final answer token")
+        self.assertEqual(entry["detail"], "final answer token")
+
+    def test_task_mode_assistant_delta_is_not_recorded_as_progress_entry(self) -> None:
+        # Task mode already streams the reply as the draft; a progress entry
+        # would duplicate it.
+        entry = WSHandler._runtime_event_to_progress_entry(
+            {
+                "type": "assistant_delta",
+                "text": "final answer token",
+                "execution_mode": "task_mode",
+            },
         )
 
         self.assertIsNone(entry)
