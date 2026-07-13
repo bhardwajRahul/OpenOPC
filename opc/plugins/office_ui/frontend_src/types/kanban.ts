@@ -298,6 +298,10 @@ export interface Session {
   detailLoaded?: boolean
   fullLoaded?: boolean
   hasMore?: boolean
+  /** Pagination state for the committed company/task transcript. */
+  summaryHasMore?: boolean
+  /** Pagination state for the full child/runtime transcript. */
+  fullHasMore?: boolean
   detailLoading?: boolean
   detailError?: string
   viewGeneration?: number

@@ -139,4 +139,17 @@ assert.match(
   'session_detail backfill of the final runtime assistant turn must clear matching Live Reply drafts',
 )
 
+// 9. Summary/full pagination and transport-local failures have independent
+// lifecycle state. A locally failed Promise never reaches onAck.
+assert.match(
+  src,
+  /void client\.sessionDetail\([\s\S]*?\.then\(\(payload\) => \{[\s\S]*?payload\.ok !== false[\s\S]*?detailLoading: false/,
+  'debounced session_detail refresh must clear loading on transport-local failure',
+)
+assert.match(
+  src,
+  /mergeSessionDetailHasMore\([\s\S]*?payload\.client_history_page === true[\s\S]*?fullHasMore: detailHasMore[\s\S]*?summaryHasMore: detailHasMore/,
+  'session_detail ACK must persist pagination state under its detail policy',
+)
+
 console.log('App.test.tsx: OK (org handlers + snapshot boundary + runtime displayTool/draft contract)')

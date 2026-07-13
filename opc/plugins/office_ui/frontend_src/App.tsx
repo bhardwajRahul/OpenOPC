@@ -18,7 +18,7 @@ import { ExecutionPanel } from './kanban/ExecutionPanel'
 import { ProjectSelector } from './components/ProjectSelector'
 import { OrgTab } from './org/OrgTab'
 import { notifyTaskAssigned } from './lib/taskChatBridge'
-import { mapCollabSyncPayload, mapBackendMessage, mapBackendChannel, mapBackendSession, mapBackendBoard, mapBackendColumn, mapBackendTask } from './lib/collabSync'
+import { mapCollabSyncPayload, mapBackendMessage, mapBackendChannel, mapBackendSession, mapBackendBoard, mapBackendColumn, mapBackendTask, mergeSessionDetailHasMore } from './lib/collabSync'
 import { normalizeOrgInfoPayload } from './lib/runtimeOrg'
 import { companyRuntimeControlPatchForBoardStatus } from './lib/sessionRuntime'
 import { getExecutionTurnId } from './lib/workItemRuntimeIds'
@@ -621,18 +621,36 @@ export default function App() {
       if (generation !== projectViewGenerationRef.current) return
       // Re-check liveness at fire time (ref may have been updated by now)
       if (!force && !shouldRefreshLiveSession(taskId, sessionStoreRef.current)) return
+      const client = clientRef.current
       sessionStoreRef.current?.updateSession(taskId, {
         detailLoading: true,
         detailError: undefined,
         viewGeneration: generation,
       })
-      clientRef.current?.sessionDetail(scopedProjectId, taskId, {
+      if (!client) {
+        sessionStoreRef.current?.updateSession(taskId, {
+          detailLoading: false,
+          detailError: 'connection_unavailable',
+        })
+        return
+      }
+      void client.sessionDetail(scopedProjectId, taskId, {
         limit: 200,
         detailLevel,
         include: detailLevel === 'full'
           ? ['messages', 'session_state', 'progress', 'work_items', 'runtime_context']
           : ['messages', 'session_state'],
         viewGeneration: generation,
+      }).then((payload) => {
+        // Transport-local failures resolve the request Promise without
+        // producing a websocket ACK.
+        if (payload.ok !== false) return
+        if (scopedProjectId !== getActiveProjectId()) return
+        if (generation !== projectViewGenerationRef.current) return
+        sessionStoreRef.current?.updateSession(taskId, {
+          detailLoading: false,
+          detailError: String(payload.error ?? 'request_failed'),
+        })
       })
     }, 180)
     pendingSessionDetailRefreshRef.current.set(timerKey, tid)
@@ -1050,6 +1068,7 @@ export default function App() {
             const totalMessageCount = typeof payload.message_count === 'number'
               ? payload.message_count
               : detailMessages.length
+            const detailLevel = payload.detail_level === 'full' ? 'full' : 'summary'
             const cs = chatStoreRef.current
             if (cs && detailMessages.length > 0) {
               cs.mergeMessagesFromBackend(detailMessages)
@@ -1057,6 +1076,14 @@ export default function App() {
             const ss = sessionStoreRef.current
             if (ss && detailTaskId) {
               const existingSession = ss.sessions.find(session => session.taskId === detailTaskId)
+              const previousHasMore = detailLevel === 'full'
+                ? existingSession?.fullHasMore
+                : existingSession?.summaryHasMore
+              const detailHasMore = mergeSessionDetailHasMore(
+                previousHasMore,
+                payload.has_more === true,
+                payload.client_history_page === true,
+              )
               const draftTurnId = String(existingSession?.draftTurnId ?? '').trim()
               const detailHasFinalForDraft = !!draftTurnId && detailMessages.some((message) => {
                 if (message.sender === 'user') return false
@@ -1079,8 +1106,11 @@ export default function App() {
                 ...(typeof payload.handoff_to === 'string' ? { handoffTo: payload.handoff_to } : {}),
                 messageCount: totalMessageCount,
                 detailLoaded: true,
-                fullLoaded: payload.detail_level === 'full' && payload.has_more !== true,
-                hasMore: payload.has_more === true,
+                ...(detailLevel === 'full' ? { fullLoaded: !detailHasMore } : {}),
+                hasMore: detailHasMore,
+                ...(detailLevel === 'full'
+                  ? { fullHasMore: detailHasMore }
+                  : { summaryHasMore: detailHasMore }),
                 detailLoading: false,
                 detailError: undefined,
                 viewGeneration: detailGeneration ?? projectViewGenerationRef.current,
@@ -2438,17 +2468,25 @@ export default function App() {
           onSessionStop={handleSessionStop}
           onSessionResume={handleSessionResume}
           onSessionComplete={(taskId) => clientRef.current?.sessionComplete(getActiveProjectId(), taskId)}
-          onLoadSessionDetail={(taskId, opts) => clientRef.current?.sessionDetail(
-            getActiveProjectId(),
-            taskId,
-            {
-              ...opts,
-              include: opts?.detailLevel === 'full'
-                ? ['messages', 'session_state', 'progress', 'work_items', 'runtime_context']
-                : ['messages', 'session_state'],
-              viewGeneration: projectViewGenerationRef.current,
-            },
-          )}
+          onLoadSessionDetail={(taskId, opts) => {
+            const client = clientRef.current
+            if (!client) return
+            return client.sessionDetail(
+              getActiveProjectId(),
+              taskId,
+              {
+                ...opts,
+                include: opts?.detailLevel === 'full'
+                  ? ['messages', 'session_state', 'progress', 'work_items', 'runtime_context']
+                  : ['messages', 'session_state'],
+                viewGeneration: projectViewGenerationRef.current,
+              },
+            ).then((payload) => {
+              if (payload.ok === false) {
+                throw new Error(String(payload.error ?? 'session_detail failed'))
+              }
+            })
+          }}
           onOpenExecutionPanel={(taskId) => setExecutionPanelTaskId(taskId)}
           onCollabSync={() => clientRef.current?.collabSync(getActiveProjectId(), undefined, projectViewGenerationRef.current)}
         />

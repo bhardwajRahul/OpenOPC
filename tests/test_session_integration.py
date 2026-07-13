@@ -21,10 +21,9 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
-import aiosqlite
-
 from opc.core.attachment_store import AttachmentRef, AttachmentStore
 from opc.core.models import DelegationRun, ExecutionCheckpoint, Task, TaskStatus
+from opc.database.store import _SQLiteConnectionAdapter
 from opc.layer2_organization import comms as file_comms
 from opc.plugins.office_ui.event_adapter import EventAdapter
 from opc.plugins.office_ui.chat_store import ChatStore
@@ -207,8 +206,8 @@ def _make_engine(store: StubStore | None = None, memory: StubMemory | None = Non
 
 async def _make_chat_store() -> ChatStore:
     """Create an in-memory ChatStore for testing."""
-    db = await aiosqlite.connect(":memory:")
-    cs = ChatStore(db)
+    db = _SQLiteConnectionAdapter(":memory:")
+    cs = ChatStore(db)  # type: ignore[arg-type]
     await cs.initialize()
     return cs
 
@@ -4442,6 +4441,97 @@ class TestWSHandlerSessionDetail(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message["content"] for message in second_payload["messages"]],
             ["oldest"],
+        )
+
+    async def test_session_detail_pages_transcript_and_ui_only_messages_together(self) -> None:
+        ws = MagicMock()
+        ws.send_json = AsyncMock()
+        base_time = datetime.now()
+
+        task = Task(
+            id="mixed-page-task-1",
+            title="Mixed source page",
+            project_id="test-project",
+            session_id="mixed-page-session-1",
+        )
+        await self.store.save_task(task)
+        self.store._transcripts["mixed-page-session-1"] = [
+            {
+                "message": SimpleNamespace(
+                    message_id="transcript-old",
+                    role="assistant",
+                    agent_id="agent-reviewer",
+                    created_at=base_time,
+                    summary_flag=False,
+                    metadata={"kind": "top_level_reply"},
+                ),
+                "parts": [SimpleNamespace(part_type="text", payload={"text": "Persisted reply"})],
+            },
+        ]
+        channel_id = "session:mixed-page-task-1"
+        await self.chat_store.create_session_channel(
+            task.id,
+            task.title,
+            project_id="test-project",
+        )
+        await self.chat_store.insert_message(
+            channel_id,
+            "system",
+            "OPC",
+            "Approval required",
+            metadata={
+                "source": "ui",
+                "detail_visibility": "summary",
+                "kind": "ui_only_notice",
+            },
+            message_id="ui-only-mid",
+            project_id="test-project",
+            created_at=base_time.timestamp() + 1,
+        )
+        await self.chat_store.insert_message(
+            channel_id,
+            "system",
+            "OPC",
+            "Legacy execution notice",
+            metadata={"source": "ui", "detail_visibility": "summary"},
+            message_id="ui-only-new",
+            project_id="test-project",
+            created_at=base_time.timestamp() + 2,
+        )
+
+        await self.handler._handle_session_detail(
+            ws,
+            {"project_id": "test-project", "task_id": task.id, "limit": 2},
+        )
+
+        first_payload = ws.send_json.await_args_list[0].args[0]["payload"]
+        self.assertEqual(first_payload["message_count"], 3)
+        self.assertEqual(first_payload["loaded_count"], 2)
+        self.assertTrue(first_payload["has_more"])
+        self.assertEqual(
+            [message["message_id"] for message in first_payload["messages"]],
+            ["ui-only-mid", "ui-only-new"],
+        )
+
+        oldest_loaded = first_payload["messages"][0]
+        await self.handler._handle_session_detail(
+            ws,
+            {
+                "project_id": "test-project",
+                "task_id": task.id,
+                "limit": 2,
+                "before_created_at": oldest_loaded["created_at"],
+                "before_message_id": oldest_loaded["message_id"],
+            },
+        )
+
+        second_payload = ws.send_json.await_args_list[1].args[0]["payload"]
+        self.assertEqual(second_payload["message_count"], 3)
+        self.assertEqual(second_payload["loaded_count"], 1)
+        self.assertFalse(second_payload["has_more"])
+        self.assertEqual(
+            [message["message_id"] for message in second_payload["messages"]],
+            ["transcript-old"],
         )
 
     async def test_session_detail_returns_silently_when_shutdown_closes_chat_db(self) -> None:

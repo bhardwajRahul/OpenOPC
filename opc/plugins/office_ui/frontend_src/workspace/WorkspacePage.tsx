@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { AgentInfo, OrgInfoPayload, SavedOrgSummary } from '../types/visual'
 import { WorkItemRecoveryPanel } from './WorkItemRecoveryPanel'
 import type { ChatMessage, CheckpointReplyMetadata, OutgoingAttachmentPayload } from '../types/chat'
@@ -14,8 +14,10 @@ import { BoardSelector } from '../kanban/BoardSelector'
 import {
   getConversationPeerSessions,
   getWorkItemChildSessions,
+  isMessageVisibleAtDetailLevel,
   mergeConversationMessages,
   projectSessionConversation,
+  selectCompanySummaryMessages,
 } from '../lib/workItemSessions'
 import { getRuntimeOrgView } from '../lib/runtimeOrg'
 import { getLinkedRuntimeTaskId } from '../lib/workItemRuntimeIds'
@@ -123,6 +125,18 @@ function sessionDetailLevel(
   if (!session) return 'summary'
   if (childDetail) return 'full'
   return session.execMode === 'company' || session.execMode === 'org' || session.execMode === 'custom' ? 'summary' : 'full'
+}
+
+function isCompanyConversation(session: Session | null | undefined, relatedSessionCount = 0): boolean {
+  if (!session) return false
+  const mode = String(session.execMode ?? '').trim().toLowerCase()
+  return relatedSessionCount > 0
+    || !!session.isCompanyRuntime
+    || !!session.roleWorkItems
+    || !!session.executorRoleWorkItems
+    || mode === 'company'
+    || mode === 'org'
+    || mode === 'custom'
 }
 
 function sessionBoardId(session: Session | null | undefined): string | null {
@@ -244,7 +258,7 @@ interface WorkspacePageProps {
   onLoadSessionDetail?: (
     taskId: string,
     opts?: { beforeCreatedAt?: number; beforeMessageId?: string; limit?: number; detailLevel?: 'summary' | 'full'; include?: string[] },
-  ) => void
+  ) => Promise<void> | void
   onOpenExecutionPanel?: (taskId: string) => void
   onCollabSync?: () => void
   orgInfoData?: OrgInfoPayload | null
@@ -304,6 +318,7 @@ export function WorkspacePage({
   onSavedOrgLoad,
 }: WorkspacePageProps) {
   const { sessions, activeSessionId, activeSession } = sessionStore
+  const { markRead } = chatStore
 
   // ── Panel state ──
   const [panelState, setPanelState] = useState<'collapsed' | 'open' | 'maximized'>('collapsed')
@@ -320,10 +335,18 @@ export function WorkspacePage({
   const [multiSessionView, setMultiSessionView] = useState(false)
   const [sessionHistoryLoading, setSessionHistoryLoading] = useState<Record<string, boolean>>({})
   const onLoadSessionDetailRef = useRef(onLoadSessionDetail)
-  const autoHistoryRequestRef = useRef<{ active: string | null; child: string | null }>({
-    active: null,
+  const sessionsRef = useRef(sessions)
+  const getChannelMessagesRef = useRef(chatStore.getChannelMessages)
+  const autoHistoryRequestRef = useRef<{ scope: string | null; active: Set<string>; child: string | null }>({
+    scope: null,
+    active: new Set(),
     child: null,
   })
+  const historyRequestInFlightRef = useRef<Set<string>>(new Set())
+  const historyRequestGenerationRef = useRef(0)
+
+  sessionsRef.current = sessions
+  getChannelMessagesRef.current = chatStore.getChannelMessages
 
   const isCompanyMode = execMode === 'company' || execMode === 'org' || execMode === 'custom'
 
@@ -375,16 +398,58 @@ export function WorkspacePage({
   ) => {
     const loadSessionDetail = onLoadSessionDetailRef.current
     if (!loadSessionDetail || !taskId) return
-    setSessionHistoryLoading(prev => prev[taskId] ? prev : { ...prev, [taskId]: true })
-    loadSessionDetail(taskId, {
-      limit: SESSION_DETAIL_PAGE_SIZE,
-      beforeCreatedAt: oldestMessage?.timestamp,
-      beforeMessageId: oldestMessage?.id,
+    const generation = historyRequestGenerationRef.current
+    const targetSession = sessionsRef.current.find(session => session.taskId === taskId)
+    const targetChannelId = targetSession?.channelId
+    const cursorMessage = oldestMessage && targetChannelId && oldestMessage.channelId !== targetChannelId
+      ? getChannelMessagesRef.current(targetChannelId).find(
+        message => isMessageVisibleAtDetailLevel(message, detailLevel),
+      )
+      : oldestMessage
+    const requestKey = [
+      generation,
+      taskId,
       detailLevel,
+      cursorMessage?.timestamp ?? 'latest',
+      cursorMessage?.id ?? '',
+    ].join('|')
+    if (historyRequestInFlightRef.current.has(requestKey)) return
+    // Claim the cursor synchronously before invoking the transport. Loading
+    // state is asynchronous and cannot serve as a single-flight guard.
+    historyRequestInFlightRef.current.add(requestKey)
+    setSessionHistoryLoading(prev => prev[taskId] ? prev : { ...prev, [taskId]: true })
+    let request: Promise<void> | void
+    try {
+      request = loadSessionDetail(taskId, {
+        limit: SESSION_DETAIL_PAGE_SIZE,
+        beforeCreatedAt: cursorMessage?.timestamp,
+        beforeMessageId: cursorMessage?.id,
+        detailLevel,
+      })
+    } catch (error) {
+      historyRequestInFlightRef.current.delete(requestKey)
+      if (historyRequestGenerationRef.current === generation) {
+        setSessionHistoryLoading(prev => prev[taskId] ? { ...prev, [taskId]: false } : prev)
+        autoHistoryRequestRef.current.active.delete(`${taskId}:${detailLevel}`)
+        if (autoHistoryRequestRef.current.child === taskId) autoHistoryRequestRef.current.child = null
+      }
+      return
+    }
+    return Promise.resolve(request).catch(() => {
+      if (historyRequestGenerationRef.current === generation) {
+        autoHistoryRequestRef.current.active.delete(`${taskId}:${detailLevel}`)
+        if (autoHistoryRequestRef.current.child === taskId) autoHistoryRequestRef.current.child = null
+      }
+    }).finally(() => {
+      historyRequestInFlightRef.current.delete(requestKey)
+      if (historyRequestGenerationRef.current !== generation) return
+      const taskPrefix = `${generation}|${taskId}|`
+      const taskStillLoading = [...historyRequestInFlightRef.current.keys()]
+        .some(key => key.startsWith(taskPrefix))
+      if (!taskStillLoading) {
+        setSessionHistoryLoading(prev => prev[taskId] ? { ...prev, [taskId]: false } : prev)
+      }
     })
-    window.setTimeout(() => {
-      setSessionHistoryLoading(prev => prev[taskId] ? { ...prev, [taskId]: false } : prev)
-    }, 800)
   }, [])
 
   const isSessionHistoryLoading = useCallback((taskId: string) => {
@@ -392,9 +457,17 @@ export function WorkspacePage({
   }, [sessionHistoryLoading])
 
   // Auto-clear childDetailTaskId if session was deleted
-  useEffect(() => {
-    autoHistoryRequestRef.current = { active: null, child: null }
+  useLayoutEffect(() => {
+    historyRequestGenerationRef.current += 1
+    historyRequestInFlightRef.current.clear()
+    autoHistoryRequestRef.current = { scope: null, active: new Set(), child: null }
+    setSessionHistoryLoading({})
   }, [projectId])
+
+  useEffect(() => () => {
+    historyRequestGenerationRef.current += 1
+    historyRequestInFlightRef.current.clear()
+  }, [])
 
   useEffect(() => {
     if (childDetailTaskId && !childDetailSession) {
@@ -432,8 +505,13 @@ export function WorkspacePage({
 
   useEffect(() => {
     if (!activeSessionId) {
-      autoHistoryRequestRef.current.active = null
+      autoHistoryRequestRef.current.scope = null
+      autoHistoryRequestRef.current.active.clear()
       return
+    }
+    if (autoHistoryRequestRef.current.scope !== activeSessionId) {
+      autoHistoryRequestRef.current.scope = activeSessionId
+      autoHistoryRequestRef.current.active.clear()
     }
     const historyTargets = activeConversation.timelineSessions.length > 0
       ? activeConversation.timelineSessions
@@ -441,22 +519,23 @@ export function WorkspacePage({
           ? [sessions.find(session => session.taskId === activeSessionId)!]
           : [])
     if (historyTargets.length === 0) {
-      autoHistoryRequestRef.current.active = null
+      autoHistoryRequestRef.current.active.clear()
       return
     }
-    const requestKey = historyTargets
-      .map((session) => `${session.taskId}:${sessionDetailLevel(session, { childDetail: session.mode === 'child' })}`)
-      .join('|')
-    if (autoHistoryRequestRef.current.active === requestKey) return
-    autoHistoryRequestRef.current.active = requestKey
     for (const session of historyTargets) {
+      const detailLevel = isCompanyConversation(activeSession, childSessions.length)
+        ? 'summary'
+        : sessionDetailLevel(session)
+      const requestKey = `${session.taskId}:${detailLevel}`
+      if (autoHistoryRequestRef.current.active.has(requestKey)) continue
+      autoHistoryRequestRef.current.active.add(requestKey)
       requestSessionHistory(
         session.taskId,
         undefined,
-        sessionDetailLevel(session, { childDetail: session.mode === 'child' }),
+        detailLevel,
       )
     }
-  }, [activeConversation.timelineSessions, activeSessionId, requestSessionHistory, sessions])
+  }, [activeConversation.timelineSessions, activeSession, activeSessionId, childSessions.length, requestSessionHistory, sessions])
 
   // Sync activeView when activeSessionId changes externally
   const effectiveView: ActiveView = useMemo(() => {
@@ -517,9 +596,13 @@ export function WorkspacePage({
         .reverse()
     }
     if (effectiveView.kind === 'session' && visibleChannelIds.length > 1) {
-      return mergeConversationMessages(
-        visibleChannelIds.map((visibleChannelId) => chatStore.getChannelMessages(visibleChannelId)),
+      const messageGroups = visibleChannelIds.map(
+        (visibleChannelId) => chatStore.getChannelMessages(visibleChannelId),
       )
+      if (isCompanyConversation(activeSession, childSessions.length) && activeSession) {
+        return selectCompanySummaryMessages(messageGroups.flat(), activeSession.channelId)
+      }
+      return mergeConversationMessages(messageGroups)
     }
     return chatStore.getChannelMessages(channelId)
   }, [
@@ -528,6 +611,8 @@ export function WorkspacePage({
     channelId,
     effectiveView.kind,
     activeChannelIds,
+    activeSession,
+    childSessions.length,
     visibleChannelIds,
   ])
   const childDetailMessages = useMemo(() => {
@@ -607,11 +692,12 @@ export function WorkspacePage({
       const sessionChildren = getWorkItemChildSessions(session, sessions)
       const sessionPeers = getConversationPeerSessions(session, sessions)
       const projection = projectSessionConversation(session, [...sessionPeers, ...sessionChildren])
-      result[session.taskId] = mergeConversationMessages(
-        projection.timelineSessions.map((timelineSession) => (
-          chatStore.getChannelMessages(timelineSession.channelId)
-        )),
-      )
+      const messageGroups = projection.timelineSessions.map((timelineSession) => (
+        chatStore.getChannelMessages(timelineSession.channelId)
+      ))
+      result[session.taskId] = isCompanyConversation(session, sessionChildren.length)
+        ? selectCompanySummaryMessages(messageGroups.flat(), session.channelId)
+        : mergeConversationMessages(messageGroups)
     }
     return result
   }, [openSessions, sessions, chatStore.getChannelMessages])
@@ -670,24 +756,16 @@ export function WorkspacePage({
     return () => document.removeEventListener('keydown', handleKeyDown)
   }, [panelState])
 
-  // Auto-mark channel as read
-  useEffect(() => {
-    if (panelState === 'collapsed') return
-    for (const visibleChannelId of visibleChannelIds) {
-      chatStore.markRead(visibleChannelId)
-    }
-  }, [visibleChannelIds, chatStore, panelState])
-
   const handleMarkRead = useCallback(() => {
     for (const visibleChannelId of visibleChannelIds) {
-      chatStore.markRead(visibleChannelId)
+      markRead(visibleChannelId)
     }
-  }, [visibleChannelIds, chatStore])
+  }, [visibleChannelIds, markRead])
 
   const handleMarkSessionRead = useCallback((taskId: string) => {
     const session = sessions.find(item => item.taskId === taskId)
-    if (session) chatStore.markRead(session.channelId)
-  }, [sessions, chatStore])
+    if (session) markRead(session.channelId)
+  }, [sessions, markRead])
 
   const focusSession = useCallback((taskId: string) => {
     const session = sessions.find(item => item.taskId === taskId)
@@ -698,8 +776,7 @@ export function WorkspacePage({
     setPanelState('open')
     setPanelTab('chat')
     setChildDetailTaskId(null)
-    chatStore.markRead(session.channelId)
-  }, [sessions, ensureSessionOpen, sessionStore, chatStore])
+  }, [sessions, ensureSessionOpen, sessionStore])
 
   const handleCloseSessionView = useCallback((taskId: string) => {
     const remaining = openSessionIds.filter(id => id !== taskId)
@@ -711,14 +788,12 @@ export function WorkspacePage({
     const nextActive = remaining[remaining.length - 1] ?? null
     sessionStore.setActiveSession(nextActive)
     if (nextActive) {
-      const nextSession = sessions.find(item => item.taskId === nextActive)
       setActiveView({ kind: 'session', taskId: nextActive })
       setPanelTab('chat')
-      if (nextSession) chatStore.markRead(nextSession.channelId)
       return
     }
     setActiveView({ kind: 'activity' })
-  }, [openSessionIds, childDetailTaskId, activeSessionId, sessionStore, sessions, chatStore])
+  }, [openSessionIds, childDetailTaskId, activeSessionId, sessionStore])
 
   // ── Session selection (sidebar click or board card click) ──
   const handleSelectSession = useCallback((taskId: string | null) => {
@@ -746,8 +821,7 @@ export function WorkspacePage({
     sessionStore.setActiveSession(null)
     setChildDetailTaskId(null)
     setPanelState('open')
-    chatStore.markRead(secretaryChannelId)
-  }, [sessionStore, chatStore, secretaryChannelId])
+  }, [sessionStore])
 
   // ── Board interactions ──
   const handleCardClick = useCallback((task: { id: string }) => {
@@ -999,9 +1073,8 @@ export function WorkspacePage({
       setChildDetailTaskId(session.taskId)
       setPanelState('open')
       setPanelTab('chat')
-      chatStore.markRead(session.channelId)
     }
-  }, [sessions, chatStore])
+  }, [sessions])
 
   const handleWorkItemClick = useCallback((executionTurnId: string) => {
     // Always forward to ExecutionPanel. The panel's lookup matches against

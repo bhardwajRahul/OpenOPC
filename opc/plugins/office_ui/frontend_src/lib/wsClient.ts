@@ -174,6 +174,9 @@ const PROJECT_SCOPED_MESSAGE_TYPES = new Set([
   'comms_read_message',
 ])
 
+const SESSION_DETAIL_REQUEST_TIMEOUT_MS = 30_000
+type SendDisposition = 'sent' | 'queued' | 'queue-full' | 'send-failed'
+
 export class VisualSocketClient {
   private ws: WebSocket | null = null
   private reconnectTimer: number | null = null
@@ -182,6 +185,18 @@ export class VisualSocketClient {
   private pendingQueue: string[] = []
   private heartbeatTimer: number | null = null
   private pongTimer: number | null = null
+  private pendingSessionDetailRequests: Array<{
+    projectId: string
+    taskId: string
+    detailLevel: 'summary' | 'full'
+    viewGeneration?: number
+    historyPage: boolean
+    wireData: string
+    queued: boolean
+    settled: boolean
+    timeout: ReturnType<typeof setTimeout> | null
+    resolve: (payload: Record<string, unknown>) => void
+  }> = []
 
   constructor(
     private url: string,
@@ -211,6 +226,7 @@ export class VisualSocketClient {
     }
     this.ws.onclose = () => {
       this.stopHeartbeat()
+      this.failPendingSessionDetailRequests('connection_closed')
       this.handlers.onStatus?.('disconnected')
       this.ws = null
       if (!this.closedByUser) {
@@ -222,6 +238,7 @@ export class VisualSocketClient {
   disconnect(): void {
     this.closedByUser = true
     this.stopHeartbeat()
+    this.failPendingSessionDetailRequests('disconnected')
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
@@ -230,18 +247,24 @@ export class VisualSocketClient {
     this.ws = null
   }
 
-  send(payload: Record<string, unknown>): void {
+  send(payload: Record<string, unknown>): SendDisposition {
     if (!this.ensureProjectScope(payload)) {
-      return
+      return 'send-failed'
     }
     const data = JSON.stringify(payload)
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       if (this.pendingQueue.length < PENDING_QUEUE_MAX) {
         this.pendingQueue.push(data)
+        return 'queued'
       }
-      return
+      return 'queue-full'
     }
-    this.ws.send(data)
+    try {
+      this.ws.send(data)
+      return 'sent'
+    } catch {
+      return 'send-failed'
+    }
   }
 
   // ── Agent management ───────────────────────────────────────────────────
@@ -411,18 +434,50 @@ export class VisualSocketClient {
     projectId: string,
     taskId: string,
     opts?: { limit?: number; beforeCreatedAt?: number; beforeMessageId?: string; detailLevel?: 'summary' | 'full'; include?: string[]; viewGeneration?: number },
-  ): void {
+  ): Promise<Record<string, unknown>> {
     const pid = this.requireProjectId(projectId, 'session_detail')
-    this.send({
-      type: 'session_detail',
-      project_id: pid,
-      task_id: taskId,
-      limit: opts?.limit,
-      before_created_at: opts?.beforeCreatedAt,
-      before_message_id: opts?.beforeMessageId,
-      detail_level: opts?.detailLevel,
-      include: opts?.include,
-      view_generation: opts?.viewGeneration,
+    const detailLevel = opts?.detailLevel ?? 'summary'
+    return new Promise((resolve) => {
+      const payload = {
+        type: 'session_detail',
+        project_id: pid,
+        task_id: taskId,
+        limit: opts?.limit,
+        before_created_at: opts?.beforeCreatedAt,
+        before_message_id: opts?.beforeMessageId,
+        detail_level: detailLevel,
+        include: opts?.include,
+        view_generation: opts?.viewGeneration,
+      }
+      const wireData = JSON.stringify(payload)
+      const request = {
+        projectId: pid,
+        taskId,
+        detailLevel,
+        viewGeneration: opts?.viewGeneration,
+        historyPage: opts?.beforeCreatedAt !== undefined || !!opts?.beforeMessageId,
+        wireData,
+        queued: false,
+        settled: false,
+        timeout: null as ReturnType<typeof setTimeout> | null,
+        resolve,
+      }
+      request.timeout = setTimeout(() => {
+        const index = this.pendingSessionDetailRequests.indexOf(request)
+        if (index >= 0) this.timeoutSessionDetailRequest(index)
+      }, SESSION_DETAIL_REQUEST_TIMEOUT_MS)
+      this.pendingSessionDetailRequests.push(request)
+      const disposition = this.send(payload)
+      request.queued = disposition === 'queued'
+      if (disposition === 'queue-full' || disposition === 'send-failed') {
+        const index = this.pendingSessionDetailRequests.indexOf(request)
+        if (index >= 0) {
+          this.failSessionDetailRequest(
+            index,
+            disposition === 'queue-full' ? 'send_queue_full' : 'send_failed',
+          )
+        }
+      }
     })
   }
 
@@ -656,9 +711,13 @@ export class VisualSocketClient {
       case 'event':
         this.handlers.onEvent?.(parsed.payload)
         break
-      case 'ack':
-        this.handlers.onAck?.(parsed.payload)
+      case 'ack': {
+        const ackPayload = this.settleSessionDetailRequest(
+          parsed.payload as unknown as Record<string, unknown>,
+        )
+        this.handlers.onAck?.(ackPayload as typeof parsed.payload)
         break
+      }
       case 'channel_created':
         this.handlers.onChannelCreated?.(parsed.payload)
         break
@@ -799,11 +858,109 @@ export class VisualSocketClient {
     } catch (e) { console.error('[wsClient] Error handling message:', parsed.type, e) }
   }
 
+  private settleSessionDetailRequest(payload: Record<string, unknown>): Record<string, unknown> {
+    const action = typeof payload.action === 'string' ? payload.action.trim() : ''
+    const isSessionDetailAck = action === 'session_detail'
+      || (!action && payload.error === 'store_not_ready')
+    if (!isSessionDetailAck) return payload
+    const projectId = this.normalizeProjectId(payload.project_id ?? payload.projectId)
+    const taskId = typeof payload.task_id === 'string' ? payload.task_id : ''
+    const detailLevel = payload.detail_level === 'full' ? 'full' : payload.detail_level === 'summary' ? 'summary' : ''
+    const viewGeneration = typeof payload.view_generation === 'number' ? payload.view_generation : undefined
+    const index = this.pendingSessionDetailRequests.findIndex(request => (
+      (!projectId || request.projectId === projectId)
+      && (!taskId || request.taskId === taskId)
+      && (!detailLevel || request.detailLevel === detailLevel)
+      && (viewGeneration === undefined || request.viewGeneration === viewGeneration)
+    ))
+    if (index < 0) return payload
+    const [request] = this.pendingSessionDetailRequests.splice(index, 1)
+    if (request.timeout !== null) clearTimeout(request.timeout)
+    const normalizedPayload = {
+      ...payload,
+      action: 'session_detail',
+      project_id: projectId || request.projectId,
+      task_id: taskId || request.taskId,
+      detail_level: detailLevel || request.detailLevel,
+      client_history_page: request.historyPage,
+    }
+    if (!request.settled) {
+      request.settled = true
+      request.resolve(normalizedPayload)
+    }
+    return normalizedPayload
+  }
+
+  private timeoutSessionDetailRequest(index: number): void {
+    const request = this.pendingSessionDetailRequests[index]
+    if (!request) return
+    if (request.queued) {
+      this.failSessionDetailRequest(index, 'request_timeout')
+      return
+    }
+
+    if (request.timeout !== null) clearTimeout(request.timeout)
+    request.timeout = null
+    if (!request.settled) {
+      request.settled = true
+      request.resolve(this.sessionDetailFailurePayload(request, 'request_timeout'))
+    }
+    // Keep a settled tombstone in FIFO order until its ACK or connection
+    // cleanup. Removing it would let a late ACK settle a newer request with
+    // identical correlation fields; closing the shared socket would interrupt
+    // unrelated runtime events.
+  }
+
+  private failSessionDetailRequest(index: number, error: string): void {
+    const [request] = this.pendingSessionDetailRequests.splice(index, 1)
+    if (!request) return
+    if (request.timeout !== null) clearTimeout(request.timeout)
+    if (request.queued) {
+      const queuedIndex = this.pendingQueue.indexOf(request.wireData)
+      if (queuedIndex >= 0) this.pendingQueue.splice(queuedIndex, 1)
+    }
+    if (!request.settled) request.resolve(this.sessionDetailFailurePayload(request, error))
+  }
+
+  private sessionDetailFailurePayload(
+    request: {
+      projectId: string
+      taskId: string
+      detailLevel: 'summary' | 'full'
+      historyPage: boolean
+    },
+    error: string,
+  ): Record<string, unknown> {
+    return {
+      ok: false,
+      action: 'session_detail',
+      error,
+      project_id: request.projectId,
+      task_id: request.taskId,
+      detail_level: request.detailLevel,
+      client_history_page: request.historyPage,
+    }
+  }
+
+  private failPendingSessionDetailRequests(error: string): void {
+    while (this.pendingSessionDetailRequests.length > 0) {
+      this.failSessionDetailRequest(0, error)
+    }
+  }
+
   private flushPendingQueue(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
     const queued = this.pendingQueue.splice(0)
     for (const data of queued) {
-      this.ws.send(data)
+      const detailRequestIndex = this.pendingSessionDetailRequests.findIndex(
+        request => request.queued && request.wireData === data,
+      )
+      try {
+        this.ws.send(data)
+        if (detailRequestIndex >= 0) this.pendingSessionDetailRequests[detailRequestIndex].queued = false
+      } catch {
+        if (detailRequestIndex >= 0) this.failSessionDetailRequest(detailRequestIndex, 'send_failed')
+      }
     }
   }
 

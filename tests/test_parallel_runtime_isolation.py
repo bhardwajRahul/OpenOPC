@@ -679,7 +679,11 @@ async def test_session_detail_routes_by_request_project_id() -> None:
     chat_store = SimpleNamespace(
         create_session_channel=AsyncMock(return_value={"channel_id": "session:task-b"}),
         backfill_messages=AsyncMock(return_value=[]),
-        get_channel_messages_page=AsyncMock(return_value=[]),
+        get_channel_messages_page_info=AsyncMock(return_value={
+            "messages": [],
+            "has_more": False,
+            "total_count": 0,
+        }),
         get_channel_messages=AsyncMock(return_value=[]),
     )
     handler = WSHandler(engine_a, MagicMock(), chat_store, _ui_event_adapter())
@@ -708,7 +712,8 @@ async def test_session_detail_routes_by_request_project_id() -> None:
         "Project B Session",
         project_id="project-b",
     )
-    assert chat_store.get_channel_messages_page.await_args.kwargs["project_id"] == "project-b"
+    assert chat_store.get_channel_messages_page_info.await_args.kwargs["project_id"] == "project-b"
+    assert chat_store.get_channel_messages_page_info.await_args.kwargs["detail_level"] == "summary"
 
 
 @_async_test

@@ -338,6 +338,8 @@ export interface ChatMessageMeta {
   kind?: string
   ui_message_id?: string
   ui_created_at?: number
+  /** UI-only identity retained across semantic result-surface replacement. */
+  ui_timeline_id?: string
   canonical_turn_id?: string
   turn_id?: string
   execution_mode?: string

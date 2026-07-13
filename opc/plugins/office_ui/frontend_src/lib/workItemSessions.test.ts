@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import type { ChatMessage } from '../types/chat'
 import type { Session } from '../types/kanban'
-import { mapBackendSession } from './collabSync'
+import { mapBackendSession, mergeSessionDetailHasMore } from './collabSync'
 import { canonicalizeSessionExecutionIdentity } from './sessionIdentity'
-import { deriveCompanyRuntimeDisplayStatus, getConversationHeaderSession, getConversationSessionView, getWorkItemChildSessions, getWorkItemRoleSessions, mergeConversationMessages, projectSessionConversation } from './workItemSessions'
+import { deriveCompanyRuntimeDisplayStatus, getConversationHeaderSession, getConversationSessionView, getWorkItemChildSessions, getWorkItemRoleSessions, mergeConversationMessages, projectSessionConversation, selectCompanySummaryMessages } from './workItemSessions'
 
 function makeSession(overrides: Partial<Session> & Pick<Session, 'taskId' | 'channelId' | 'title' | 'status' | 'columnId' | 'assigneeIds' | 'priority' | 'tags' | 'progressLog' | 'createdAt' | 'updatedAt' | 'messageCount'>): Session {
   return {
@@ -189,6 +189,161 @@ const mergedDeliveryMessages = mergeConversationMessages([
 
 assert.equal(mergedDeliveryMessages.length, 1)
 assert.equal(mergedDeliveryMessages[0]?.id, 'child-direct')
+
+const earlierResult = {
+  ...resultMessage(
+    'earlier-parent-result',
+    'session:company-root',
+    finalBody,
+    { source: 'engine', transcript_kind: 'child_result' },
+  ),
+  timestamp: 900,
+}
+const authoritativeResult = {
+  ...resultMessage(
+    'later-authoritative-result',
+    'session:company-child',
+    finalBody,
+    { source: 'engine', transcript_kind: 'child_task_result' },
+  ),
+  timestamp: 1_100,
+}
+for (const groups of [
+  [[earlierResult], [authoritativeResult]],
+  [[authoritativeResult], [earlierResult]],
+]) {
+  const result = mergeConversationMessages(groups)
+  assert.equal(result.length, 1)
+  assert.equal(result[0]?.id, 'later-authoritative-result')
+  assert.equal(result[0]?.timestamp, 900, 'result chronology must not depend on channel traversal order')
+}
+
+const pendingCheckpoint = {
+  ...resultMessage(
+    'pending-checkpoint-surface',
+    'session:company-root',
+    'Approval required.',
+    { checkpoint_id: 'shared-checkpoint', checkpoint_type: 'human_escalation', status: 'pending' },
+    'system',
+  ),
+  timestamp: 1_200,
+}
+const resolvedCheckpoint = {
+  ...resultMessage(
+    'resolved-checkpoint-surface',
+    'session:company-child',
+    'Approval required.',
+    { checkpoint_id: 'shared-checkpoint', checkpoint_type: 'human_escalation', status: 'resolved' },
+    'system',
+  ),
+  timestamp: 1_300,
+}
+const mergedCheckpoint = mergeConversationMessages([[pendingCheckpoint], [resolvedCheckpoint]])
+assert.equal(mergedCheckpoint.length, 1)
+assert.equal(mergedCheckpoint[0]?.id, 'pending-checkpoint-surface')
+assert.equal(mergedCheckpoint[0]?.timestamp, 1_200)
+assert.equal(mergedCheckpoint[0]?.metadata?.status, 'resolved')
+
+const companySummaryMessages = selectCompanySummaryMessages([
+  resultMessage(
+    'parent-user',
+    'session:company-root',
+    'Please investigate the issue.',
+    { source: 'ui' },
+    'user',
+  ),
+  resultMessage(
+    'child-transient',
+    'session:company-child',
+    'A child draft or internal assistant turn must stay out of the parent transcript.',
+    { source: 'runtime_event', transcript_kind: 'runtime_v2_assistant' },
+    'assistant',
+  ),
+  resultMessage(
+    'canonical-role-result',
+    'session:company-child',
+    'The canonical role delivery remains visible in the company summary.',
+    { source: 'engine', transcript_kind: 'company_role_result' },
+    'assistant',
+  ),
+  resultMessage(
+    'summary-company-final',
+    'session:company-child',
+    'A summary-visible company final remains when no canonical role mirror exists.',
+    { source: 'engine', kind: 'runtime_v2_company_assistant', detail_visibility: 'summary' },
+    'assistant',
+  ),
+  {
+    ...resultMessage(
+      'parent-full-only-terminal',
+      'session:company-root',
+      'A full-only parent surface must neither render nor suppress the committed child summary.',
+      {
+        source: 'engine',
+        transcript_kind: 'runtime_v2_assistant',
+        detail_visibility: 'full',
+        canonical_turn_id: 'shared-terminal-turn',
+      },
+      'assistant',
+    ),
+    timestamp: 1400,
+  },
+  {
+    ...resultMessage(
+      'summary-terminal-a',
+      'session:company-child',
+      'First authoritative terminal for one shared canonical turn.',
+      {
+        source: 'engine',
+        transcript_kind: 'runtime_v2_assistant',
+        detail_visibility: 'summary',
+        canonical_turn_id: 'shared-terminal-turn',
+      },
+      'assistant',
+    ),
+    timestamp: 1200,
+  },
+  {
+    ...resultMessage(
+      'summary-terminal-b',
+      'session:company-sibling',
+      'A second terminal surface with different content must not duplicate the turn.',
+      {
+        source: 'engine',
+        transcript_kind: 'runtime_v2_assistant',
+        detail_visibility: 'summary',
+        canonical_turn_id: 'shared-terminal-turn',
+      },
+      'assistant',
+    ),
+    timestamp: 1300,
+  },
+  resultMessage(
+    'child-checkpoint',
+    'session:company-child',
+    'Approval is required.',
+    { checkpoint_id: 'checkpoint-child', checkpoint_type: 'company_work_item_gate' },
+    'assistant',
+  ),
+  resultMessage(
+    'child-checkpoint-response',
+    'session:company-child',
+    'Approved.',
+    { response_to_checkpoint_id: 'checkpoint-child', ui_message_id: 'ui-checkpoint-response' },
+    'user',
+  ),
+], 'session:company-root')
+assert.deepEqual(
+  companySummaryMessages.map(message => message.id).sort(),
+  [
+    'parent-user',
+    'canonical-role-result',
+    'summary-company-final',
+    'summary-terminal-b',
+    'child-checkpoint',
+    'child-checkpoint-response',
+  ].sort(),
+)
 assert.equal(companyHeaderView?.status, 'running')
 assert.equal(companyHeaderView?.contextTokens, 0)
 assert.equal(companyHeaderView?.contextWindow, 128000)
@@ -368,5 +523,16 @@ const mappedCompanySession = mapBackendSession({
 assert.equal(mappedCompanySession.execMode, 'company')
 assert.equal(mappedCompanySession.companyProfile, 'corporate')
 assert.equal(mappedCompanySession.orgId, undefined)
+
+assert.equal(
+  mergeSessionDetailHasMore(false, true, false),
+  false,
+  'a cursorless live refresh must not reopen an exhausted history boundary',
+)
+assert.equal(
+  mergeSessionDetailHasMore(false, true, true),
+  true,
+  'a real cursor page may advance the scoped history boundary',
+)
 
 console.log('workItemSessions origin-task linking checks passed')

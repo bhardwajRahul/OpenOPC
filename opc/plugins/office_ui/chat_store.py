@@ -7,14 +7,19 @@ Channel/message format uses snake_case to match what collabSync.ts expects.
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
+import math
 import re
 import sqlite3
+import struct
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 import aiosqlite
+from opc.core.transcript_visibility import rendered_transcript_visibility_sql
 from opc.layer3_agent.adapters.codex_adapter import CodexAdapter
 
 _LOCKED_ERROR_MARKERS = ("database is locked", "database table is locked")
@@ -26,6 +31,505 @@ def _is_locked_error(exc: BaseException) -> bool:
     return isinstance(exc, sqlite3.OperationalError) and any(
         marker in str(exc).lower() for marker in _LOCKED_ERROR_MARKERS
     )
+
+
+@dataclass(frozen=True)
+class _MessageMatchState:
+    """Prepared fields used by semantic message de-duplication.
+
+    Transcript rows can contain several kilobytes of Markdown.  Preparing the
+    normalized content once prevents every candidate comparison from repeating
+    that work.
+    """
+
+    channel_id: str
+    identity_keys: frozenset[str]
+    role_bucket: str
+    normalized_content: str
+    reply_to_id: str
+    is_result_surface: bool
+    has_engine_source: bool
+    timestamp: float
+
+    @classmethod
+    def from_message(
+        cls,
+        owner: Any,
+        message: dict[str, Any],
+    ) -> _MessageMatchState:
+        return cls(
+            channel_id=str(message.get("channel_id", "") or ""),
+            identity_keys=frozenset(owner._message_identity_keys(message)),
+            role_bucket=owner._message_role_bucket(message),
+            normalized_content=owner._normalize_duplicate_content(message.get("content", "")),
+            reply_to_id=str(message.get("reply_to_id", "") or ""),
+            is_result_surface=owner._message_is_result_surface(message),
+            has_engine_source=owner._message_has_engine_source(message),
+            timestamp=owner._message_timestamp(message),
+        )
+
+    def matches(self, candidate: _MessageMatchState, *, duplicate_window: float) -> bool:
+        if self.channel_id != candidate.channel_id:
+            return False
+        if self.identity_keys & candidate.identity_keys:
+            return True
+        if self.role_bucket != candidate.role_bucket:
+            return False
+        if self.normalized_content != candidate.normalized_content:
+            return False
+        both_result_surfaces = self.is_result_surface and candidate.is_result_surface
+        if not both_result_surfaces and self.reply_to_id != candidate.reply_to_id:
+            return False
+        if not (self.has_engine_source or candidate.has_engine_source):
+            return False
+        if (
+            not both_result_surfaces
+            and self.timestamp
+            and candidate.timestamp
+            and abs(self.timestamp - candidate.timestamp) > duplicate_window
+        ):
+            return False
+        return True
+
+
+@dataclass
+class _TimestampRangeNode:
+    """Treap node augmented with the greatest timeline index below it."""
+
+    key: tuple[float, int]
+    priority: int
+    left: _TimestampRangeNode | None = None
+    right: _TimestampRangeNode | None = None
+    max_index: int = -1
+
+    def __post_init__(self) -> None:
+        self.max_index = self.key[1]
+
+
+class _TimestampRangeTree:
+    """Dynamic timestamp range -> latest timeline index map.
+
+    A deterministic treap avoids depending on insertion order while supporting
+    insert, delete, and inclusive range maximum in expected O(log n).
+    """
+
+    _MASK_64 = (1 << 64) - 1
+
+    def __init__(self) -> None:
+        self._root: _TimestampRangeNode | None = None
+
+    @classmethod
+    def _priority(cls, index: int) -> int:
+        # SplitMix64 is a bijective mixer for the practical index range, giving
+        # deterministic pseudo-random treap priorities without global RNG state.
+        value = (index + 0x9E3779B97F4A7C15) & cls._MASK_64
+        value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & cls._MASK_64
+        value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & cls._MASK_64
+        return value ^ (value >> 31)
+
+    @staticmethod
+    def _refresh(node: _TimestampRangeNode | None) -> None:
+        if node is None:
+            return
+        node.max_index = max(
+            node.key[1],
+            node.left.max_index if node.left is not None else -1,
+            node.right.max_index if node.right is not None else -1,
+        )
+
+    @classmethod
+    def _split(
+        cls,
+        node: _TimestampRangeNode | None,
+        key: tuple[float, float | int],
+    ) -> tuple[_TimestampRangeNode | None, _TimestampRangeNode | None]:
+        if node is None:
+            return None, None
+        if node.key < key:
+            node.right, right = cls._split(node.right, key)
+            cls._refresh(node)
+            return node, right
+        left, node.left = cls._split(node.left, key)
+        cls._refresh(node)
+        return left, node
+
+    @classmethod
+    def _merge(
+        cls,
+        left: _TimestampRangeNode | None,
+        right: _TimestampRangeNode | None,
+    ) -> _TimestampRangeNode | None:
+        if left is None:
+            return right
+        if right is None:
+            return left
+        if left.priority > right.priority:
+            left.right = cls._merge(left.right, right)
+            cls._refresh(left)
+            return left
+        right.left = cls._merge(left, right.left)
+        cls._refresh(right)
+        return right
+
+    @classmethod
+    def _insert(
+        cls,
+        root: _TimestampRangeNode | None,
+        node: _TimestampRangeNode,
+    ) -> _TimestampRangeNode:
+        if root is None:
+            return node
+        if node.key == root.key:
+            return root
+        if node.priority > root.priority:
+            node.left, node.right = cls._split(root, node.key)
+            cls._refresh(node)
+            return node
+        if node.key < root.key:
+            root.left = cls._insert(root.left, node)
+        else:
+            root.right = cls._insert(root.right, node)
+        cls._refresh(root)
+        return root
+
+    @classmethod
+    def _remove(
+        cls,
+        root: _TimestampRangeNode | None,
+        key: tuple[float, int],
+    ) -> _TimestampRangeNode | None:
+        if root is None:
+            return None
+        if key == root.key:
+            return cls._merge(root.left, root.right)
+        if key < root.key:
+            root.left = cls._remove(root.left, key)
+        else:
+            root.right = cls._remove(root.right, key)
+        cls._refresh(root)
+        return root
+
+    def add(self, timestamp: float, index: int) -> None:
+        self._root = self._insert(
+            self._root,
+            _TimestampRangeNode(
+                key=(timestamp, index),
+                priority=self._priority(index),
+            ),
+        )
+
+    def remove(self, timestamp: float, index: int) -> None:
+        self._root = self._remove(self._root, (timestamp, index))
+
+    def latest(self) -> int | None:
+        return self._root.max_index if self._root is not None else None
+
+    def latest_in_range(self, lower: float, upper: float) -> int | None:
+        left, middle_and_right = self._split(self._root, (lower, -1))
+        middle, right = self._split(middle_and_right, (upper, math.inf))
+        result = middle.max_index if middle is not None else None
+        self._root = self._merge(left, self._merge(middle, right))
+        return result
+
+
+class _MessageMatchIndex:
+    """Versioned indexes for finding the latest semantic duplicate.
+
+    The legacy implementation scanned every previously emitted row backwards.
+    Identity and result-surface matches use max-heaps. Ordinary matches use an
+    exact timestamp range tree, so backfilling old history cannot repeatedly
+    scan newer same-content rows outside the duplicate window. Replacing a
+    merged row bumps its heap version and moves its timestamp-tree entry.
+    """
+
+    def __init__(
+        self,
+        owner: Any,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        self._owner = owner
+        self._messages = messages
+        self._versions: list[int] = [0 for _ in messages]
+        self._states = [
+            _MessageMatchState.from_message(owner, message)
+            for message in messages
+        ]
+        self._identity_heaps: dict[tuple[str, str], list[tuple[int, int]]] = {}
+        self._timed_trees: dict[tuple[str, str, str, str], _TimestampRangeTree] = {}
+        self._timed_engine_trees: dict[tuple[str, str, str, str], _TimestampRangeTree] = {}
+        self._timed_unbounded_heaps: dict[tuple[str, str, str, str], list[tuple[int, int]]] = {}
+        self._timed_engine_unbounded_heaps: dict[tuple[str, str, str, str], list[tuple[int, int]]] = {}
+        self._result_heaps: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
+        self._result_engine_heaps: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
+        for index in range(len(messages)):
+            self._push(index)
+
+    @staticmethod
+    def _push_heap(
+        heaps: dict[Any, list[tuple[int, int]]],
+        key: Any,
+        index: int,
+        version: int,
+    ) -> None:
+        heapq.heappush(heaps.setdefault(key, []), (-index, version))
+
+    @staticmethod
+    def _semantic_key(state: _MessageMatchState) -> tuple[str, str, str]:
+        return (state.channel_id, state.role_bucket, state.normalized_content)
+
+    @classmethod
+    def _timed_key(cls, state: _MessageMatchState) -> tuple[str, str, str, str]:
+        return (*cls._semantic_key(state), state.reply_to_id)
+
+    @staticmethod
+    def _timestamp_is_unbounded(timestamp: float) -> bool:
+        # The legacy predicate deliberately skipped its window check for zero;
+        # NaN also made ``abs(delta) > window`` false and must stay equivalent.
+        return timestamp == 0 or math.isnan(timestamp)
+
+    @staticmethod
+    def _float_to_ordered_int(value: float) -> int:
+        """Map an IEEE-754 double to an integer with numeric sort order."""
+        bits = struct.unpack(">Q", struct.pack(">d", value))[0]
+        if bits & (1 << 63):
+            return (~bits) & ((1 << 64) - 1)
+        return bits | (1 << 63)
+
+    @staticmethod
+    def _ordered_int_to_float(value: int) -> float:
+        if value & (1 << 63):
+            bits = value & ((1 << 63) - 1)
+        else:
+            bits = (~value) & ((1 << 64) - 1)
+        return struct.unpack(">d", struct.pack(">Q", bits))[0]
+
+    @classmethod
+    def _finite_timestamp_match_bounds(
+        cls,
+        candidate_timestamp: float,
+        window: float,
+    ) -> tuple[float, float]:
+        """Exact finite-float bounds accepted by the legacy delta predicate.
+
+        Computing ``candidate +/- window`` is subtly insufficient around a
+        rounding boundary (for example ``2.0 - (-1e-300)`` rounds to exactly
+        ``2.0``).  Binary searching the ordered double domain preserves the
+        old IEEE-754 comparison exactly.  The domain is fixed at 64 bits, so
+        this adds constant work before the tree's O(log n) range query.
+        """
+        candidate_order = cls._float_to_ordered_int(candidate_timestamp)
+
+        lower_rejected = cls._float_to_ordered_int(-math.inf)
+        lower_accepted = candidate_order
+        while lower_rejected + 1 < lower_accepted:
+            middle = (lower_rejected + lower_accepted) // 2
+            value = cls._ordered_int_to_float(middle)
+            if abs(value - candidate_timestamp) <= window:
+                lower_accepted = middle
+            else:
+                lower_rejected = middle
+
+        upper_accepted = candidate_order
+        upper_rejected = cls._float_to_ordered_int(math.inf)
+        while upper_accepted + 1 < upper_rejected:
+            middle = (upper_accepted + upper_rejected) // 2
+            value = cls._ordered_int_to_float(middle)
+            if abs(value - candidate_timestamp) <= window:
+                upper_accepted = middle
+            else:
+                upper_rejected = middle
+
+        return (
+            cls._ordered_int_to_float(lower_accepted),
+            cls._ordered_int_to_float(upper_accepted),
+        )
+
+    @staticmethod
+    def _add_to_tree(
+        trees: dict[tuple[str, str, str, str], _TimestampRangeTree],
+        key: tuple[str, str, str, str],
+        timestamp: float,
+        index: int,
+    ) -> None:
+        trees.setdefault(key, _TimestampRangeTree()).add(timestamp, index)
+
+    def _push(self, index: int) -> None:
+        state = self._states[index]
+        version = self._versions[index]
+        for identity_key in state.identity_keys:
+            self._push_heap(
+                self._identity_heaps,
+                (state.channel_id, identity_key),
+                index,
+                version,
+            )
+
+        semantic_key = self._semantic_key(state)
+        timed_key = self._timed_key(state)
+        if self._timestamp_is_unbounded(state.timestamp):
+            self._push_heap(
+                self._timed_unbounded_heaps,
+                timed_key,
+                index,
+                version,
+            )
+            if state.has_engine_source:
+                self._push_heap(
+                    self._timed_engine_unbounded_heaps,
+                    timed_key,
+                    index,
+                    version,
+                )
+        else:
+            self._add_to_tree(
+                self._timed_trees,
+                timed_key,
+                state.timestamp,
+                index,
+            )
+            if state.has_engine_source:
+                self._add_to_tree(
+                    self._timed_engine_trees,
+                    timed_key,
+                    state.timestamp,
+                    index,
+                )
+        if state.is_result_surface:
+            self._push_heap(self._result_heaps, semantic_key, index, version)
+            if state.has_engine_source:
+                self._push_heap(self._result_engine_heaps, semantic_key, index, version)
+
+    def prepare(self, message: dict[str, Any]) -> _MessageMatchState:
+        return _MessageMatchState.from_message(self._owner, message)
+
+    def append(
+        self,
+        message: dict[str, Any],
+        *,
+        prepared_state: _MessageMatchState | None = None,
+    ) -> int:
+        index = len(self._messages)
+        self._messages.append(message)
+        self._versions.append(0)
+        self._states.append(prepared_state or self.prepare(message))
+        self._push(index)
+        return index
+
+    def replace(self, index: int, message: dict[str, Any]) -> None:
+        old_state = self._states[index]
+        if not self._timestamp_is_unbounded(old_state.timestamp):
+            timed_key = self._timed_key(old_state)
+            tree = self._timed_trees.get(timed_key)
+            if tree is not None:
+                tree.remove(old_state.timestamp, index)
+            if old_state.has_engine_source:
+                engine_tree = self._timed_engine_trees.get(timed_key)
+                if engine_tree is not None:
+                    engine_tree.remove(old_state.timestamp, index)
+        self._messages[index] = message
+        self._versions[index] += 1
+        self._states[index] = _MessageMatchState.from_message(self._owner, message)
+        self._push(index)
+
+    def _latest_from_heap(
+        self,
+        heap: list[tuple[int, int]] | None,
+        candidate: _MessageMatchState,
+        excluded_message_ids: set[str],
+    ) -> int | None:
+        if not heap:
+            return None
+        while heap:
+            negative_index, version = heap[0]
+            index = -negative_index
+            if version != self._versions[index]:
+                heapq.heappop(heap)
+                continue
+            message_id = str(self._messages[index].get("message_id", "") or "")
+            if message_id in excluded_message_ids:
+                heapq.heappop(heap)
+                continue
+            existing = self._states[index]
+            if existing.matches(
+                candidate,
+                duplicate_window=self._owner._DUPLICATE_WINDOW_SECONDS,
+            ):
+                return index
+            # Identity/result/unbounded timed buckets are exact. A current
+            # non-match therefore cannot become valid for this bucket later.
+            heapq.heappop(heap)
+        return None
+
+    def _latest_from_time_tree(
+        self,
+        tree: _TimestampRangeTree | None,
+        candidate: _MessageMatchState,
+        excluded_message_ids: set[str],
+    ) -> int | None:
+        if tree is None:
+            return None
+        while True:
+            if self._timestamp_is_unbounded(candidate.timestamp):
+                index = tree.latest()
+            else:
+                window = self._owner._DUPLICATE_WINDOW_SECONDS
+                if math.isfinite(candidate.timestamp):
+                    lower, upper = self._finite_timestamp_match_bounds(
+                        candidate.timestamp,
+                        window,
+                    )
+                else:
+                    lower = upper = candidate.timestamp
+                index = tree.latest_in_range(lower, upper)
+            if index is None:
+                return None
+            existing = self._states[index]
+            message_id = str(self._messages[index].get("message_id", "") or "")
+            if message_id not in excluded_message_ids and existing.matches(
+                candidate,
+                duplicate_window=self._owner._DUPLICATE_WINDOW_SECONDS,
+            ):
+                return index
+            # Consumed entries never become eligible again during this index's
+            # lifetime. Signature changes use ``replace`` and reinsert exactly.
+            tree.remove(existing.timestamp, index)
+
+    def latest_match(
+        self,
+        candidate_message: dict[str, Any],
+        *,
+        excluded_message_ids: set[str] | None = None,
+        prepared_state: _MessageMatchState | None = None,
+    ) -> int | None:
+        candidate = prepared_state or self.prepare(candidate_message)
+        excluded = excluded_message_ids or set()
+        heaps: list[list[tuple[int, int]] | None] = []
+        for identity_key in candidate.identity_keys:
+            heaps.append(self._identity_heaps.get((candidate.channel_id, identity_key)))
+
+        semantic_key = self._semantic_key(candidate)
+        timed_key = self._timed_key(candidate)
+        if candidate.has_engine_source:
+            timed_tree = self._timed_trees.get(timed_key)
+            heaps.append(self._timed_unbounded_heaps.get(timed_key))
+        else:
+            timed_tree = self._timed_engine_trees.get(timed_key)
+            heaps.append(self._timed_engine_unbounded_heaps.get(timed_key))
+        if candidate.is_result_surface:
+            if candidate.has_engine_source:
+                heaps.append(self._result_heaps.get(semantic_key))
+            else:
+                heaps.append(self._result_engine_heaps.get(semantic_key))
+
+        matches: list[int] = [
+            index
+            for heap in heaps
+            if (index := self._latest_from_heap(heap, candidate, excluded)) is not None
+        ]
+        timed_index = self._latest_from_time_tree(timed_tree, candidate, excluded)
+        if timed_index is not None:
+            matches.append(timed_index)
+        return max(matches) if matches else None
 
 
 class ChatStore:
@@ -167,29 +671,10 @@ class ChatStore:
         existing: dict[str, Any],
         candidate: dict[str, Any],
     ) -> bool:
-        if str(existing.get("channel_id", "") or "") != str(candidate.get("channel_id", "") or ""):
-            return False
-        if cls._message_identity_keys(existing) & cls._message_identity_keys(candidate):
-            return True
-        if cls._message_role_bucket(existing) != cls._message_role_bucket(candidate):
-            return False
-        if cls._normalize_duplicate_content(existing.get("content", "")) != cls._normalize_duplicate_content(candidate.get("content", "")):
-            return False
-        both_result_surfaces = cls._message_is_result_surface(existing) and cls._message_is_result_surface(candidate)
-        if not both_result_surfaces and str(existing.get("reply_to_id", "") or "") != str(candidate.get("reply_to_id", "") or ""):
-            return False
-        if not (cls._message_has_engine_source(existing) or cls._message_has_engine_source(candidate)):
-            return False
-        existing_ts = cls._message_timestamp(existing)
-        candidate_ts = cls._message_timestamp(candidate)
-        if (
-            not both_result_surfaces
-            and existing_ts
-            and candidate_ts
-            and abs(existing_ts - candidate_ts) > cls._DUPLICATE_WINDOW_SECONDS
-        ):
-            return False
-        return True
+        return _MessageMatchState.from_message(cls, existing).matches(
+            _MessageMatchState.from_message(cls, candidate),
+            duplicate_window=cls._DUPLICATE_WINDOW_SECONDS,
+        )
 
     @classmethod
     def _merge_duplicate_messages(
@@ -266,16 +751,23 @@ class ChatStore:
 
     def _dedupe_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         deduped: list[dict[str, Any]] = []
+        match_index = _MessageMatchIndex(
+            self,
+            deduped,
+        )
         for message in sorted(messages, key=self._message_timestamp):
-            match_index: int | None = None
-            for index in range(len(deduped) - 1, -1, -1):
-                if self._messages_semantically_match(deduped[index], message):
-                    match_index = index
-                    break
-            if match_index is None:
-                deduped.append(message)
+            prepared_state = match_index.prepare(message)
+            duplicate_index = match_index.latest_match(
+                message,
+                prepared_state=prepared_state,
+            )
+            if duplicate_index is None:
+                match_index.append(message, prepared_state=prepared_state)
                 continue
-            deduped[match_index] = self._merge_duplicate_messages(deduped[match_index], message)
+            match_index.replace(
+                duplicate_index,
+                self._merge_duplicate_messages(deduped[duplicate_index], message),
+            )
         return deduped
 
     async def _message_scope(self, message_id: str) -> tuple[str, str] | None:
@@ -1060,6 +1552,14 @@ class ChatStore:
         existing_rows = await cursor.fetchall()
         existing_messages = [self._row_to_message_dict(row) for row in existing_rows]
         existing_ids = {message["message_id"] for message in existing_messages}
+        existing_positions = {
+            message["message_id"]: index
+            for index, message in enumerate(existing_messages)
+        }
+        semantic_index = _MessageMatchIndex(
+            self,
+            existing_messages,
+        )
         consumed_existing_ids: set[str] = set()
         inserted_messages: list[dict[str, Any]] = []
         changed_existing = False
@@ -1078,11 +1578,9 @@ class ChatStore:
             }
             mid = normalized_message["message_id"]
             if mid in existing_ids:
-                existing_match = next(
-                    (existing for existing in existing_messages if existing["message_id"] == mid),
-                    None,
-                )
-                if existing_match is not None:
+                existing_index = existing_positions.get(mid)
+                if existing_index is not None:
+                    existing_match = existing_messages[existing_index]
                     merged_existing = self._merge_duplicate_messages(existing_match, normalized_message)
                     if not self._message_persisted_equal(existing_match, merged_existing):
                         merged_timestamp = self._message_timestamp(merged_existing) or time.time()
@@ -1102,13 +1600,10 @@ class ChatStore:
                                 project_id,
                             ),
                         )
-                        for idx, existing in enumerate(existing_messages):
-                            if existing["message_id"] == mid:
-                                existing_messages[idx] = {
-                                    **merged_existing,
-                                    "created_at": merged_timestamp,
-                                }
-                                break
+                        semantic_index.replace(existing_index, {
+                            **merged_existing,
+                            "created_at": merged_timestamp,
+                        })
                         inserted_messages.append({
                             **merged_existing,
                             "channel_id": channel_id,
@@ -1131,7 +1626,7 @@ class ChatStore:
                 )
                 if merged is not None:
                     existing_ids.add(mid)
-                    existing_messages.append(merged)
+                    existing_positions[mid] = semantic_index.append(merged)
                     continue
             if existing_scope and existing_scope != (channel_id, project_id):
                 metadata = dict(normalized_message.get("metadata", {}) or {})
@@ -1144,17 +1639,14 @@ class ChatStore:
                 )
                 normalized_message["message_id"] = mid
 
-            duplicate_existing = next(
-                (
-                    existing
-                    for existing in reversed(existing_messages)
-                    if existing["message_id"] not in consumed_existing_ids
-                    and self._messages_semantically_match(existing, normalized_message)
-                ),
-                None,
+            duplicate_index = semantic_index.latest_match(
+                normalized_message,
+                excluded_message_ids=consumed_existing_ids,
             )
-            if duplicate_existing is not None:
-                consumed_existing_ids.add(duplicate_existing["message_id"])
+            if duplicate_index is not None:
+                consumed_existing_ids.add(
+                    existing_messages[duplicate_index]["message_id"]
+                )
                 continue
 
             try:
@@ -1184,8 +1676,9 @@ class ChatStore:
                     candidate=normalized_message,
                 )
                 if merged is not None:
-                    existing_ids.add(normalized_message["message_id"])
-                    existing_messages.append(merged)
+                    merged_id = normalized_message["message_id"]
+                    existing_ids.add(merged_id)
+                    existing_positions[merged_id] = semantic_index.append(merged)
                     continue
                 metadata = dict(normalized_message.get("metadata", {}) or {})
                 metadata.setdefault("ui_message_id", normalized_message["message_id"])
@@ -1216,7 +1709,7 @@ class ChatStore:
                 )
             inserted_messages.append(normalized_message)
             existing_ids.add(mid)
-            existing_messages.append({
+            existing_positions[mid] = semantic_index.append({
                 **normalized_message,
                 "created_at": normalized_message["timestamp"],
             })
@@ -1253,49 +1746,124 @@ class ChatStore:
         limit: int = 100,
         before_timestamp: float | None = None,
         before_message_id: str | None = None,
+        detail_level: str = "full",
         project_id: str = "default",
     ) -> list[dict[str, Any]]:
-        """Return a paginated, de-duplicated channel slice in chronological order."""
-        fetch_limit = max(limit * 8, limit + 1, 1)
+        """Return the message slice from :meth:`get_channel_messages_page_info`.
+
+        This compatibility wrapper intentionally delegates cursor handling to
+        the exact pager so callers cannot accidentally paginate raw rows before
+        renderer visibility and semantic de-duplication have been applied.
+        """
+        page = await self.get_channel_messages_page_info(
+            channel_id,
+            limit=limit,
+            before_timestamp=before_timestamp,
+            before_message_id=before_message_id,
+            detail_level=detail_level,
+            project_id=project_id,
+        )
+        return page["messages"]
+
+    async def _get_channel_visible_messages(
+        self,
+        channel_id: str,
+        *,
+        detail_level: str,
+        project_id: str,
+    ) -> list[dict[str, Any]]:
+        """Load the final UI-visible, de-duplicated channel timeline.
+
+        The cache stores both transcript backfill and UI-only rows such as
+        approval cards and legacy notices.  SQL can exclude detail-only rows,
+        but only the message formatter's semantic merge can determine the
+        final rows.  Consequently the merge must happen across the complete
+        visible set before a page boundary is chosen.
+        """
         query = (
             "SELECT message_id, channel_id, sender, sender_name, content, "
             "timestamp, reply_to_id, mentions, metadata "
             "FROM messages WHERE channel_id = ? AND project_id = ?"
         )
-        params: list[Any] = [channel_id, project_id]
+        query += rendered_transcript_visibility_sql(
+            detail_level=detail_level,
+        )
+        query += " ORDER BY timestamp ASC, message_id ASC"
+        cursor = await self._db.execute(query, (channel_id, project_id))
+        rows = await cursor.fetchall()
+        messages = [self._row_to_message_dict(row) for row in rows]
+        deduped = self._dedupe_messages(messages)
+        return sorted(
+            deduped,
+            key=lambda message: (
+                self._message_timestamp(message),
+                str(message.get("message_id", "") or ""),
+            ),
+        )
+
+    async def get_channel_messages_page_info(
+        self,
+        channel_id: str,
+        *,
+        limit: int = 100,
+        before_timestamp: float | None = None,
+        before_message_id: str | None = None,
+        detail_level: str = "full",
+        project_id: str = "default",
+    ) -> dict[str, Any]:
+        """Return an exact final-visible page and its pagination metadata.
+
+        ``total_count`` counts the de-duplicated UI rows for the whole channel;
+        ``has_more`` describes rows older than the returned page for the given
+        cursor.  Both values include UI-only messages that have no transcript
+        counterpart.
+        """
+        messages = await self._get_channel_visible_messages(
+            channel_id,
+            detail_level=detail_level,
+            project_id=project_id,
+        )
+        total_count = len(messages)
+        candidates = messages
         normalized_before_id = str(before_message_id or "").strip()
         if before_timestamp is not None:
+            normalized_before_timestamp = float(before_timestamp)
             if normalized_before_id:
-                query += " AND (timestamp < ? OR (timestamp = ? AND message_id < ?))"
-                params.extend([before_timestamp, before_timestamp, normalized_before_id])
+                candidates = [
+                    message
+                    for message in messages
+                    if (
+                        self._message_timestamp(message),
+                        str(message.get("message_id", "") or ""),
+                    ) < (normalized_before_timestamp, normalized_before_id)
+                ]
             else:
-                query += " AND timestamp < ?"
-                params.append(before_timestamp)
-        query += " ORDER BY timestamp DESC, message_id DESC LIMIT ?"
-        params.append(fetch_limit)
+                candidates = [
+                    message
+                    for message in messages
+                    if self._message_timestamp(message) < normalized_before_timestamp
+                ]
+        normalized_limit = max(int(limit), 1)
+        return {
+            "messages": candidates[-normalized_limit:],
+            "has_more": len(candidates) > normalized_limit,
+            "total_count": total_count,
+        }
 
-        cursor = await self._db.execute(query, tuple(params))
-        rows = await cursor.fetchall()
-        messages = [self._row_to_message_dict(row) for row in rows]
-        messages.reverse()
-        messages = self._dedupe_messages(messages)
-        if len(messages) > limit:
-            messages = messages[-limit:]
-        return messages
-
-    async def get_channel_visible_message_count(self, channel_id: str, project_id: str = "default") -> int:
+    async def get_channel_visible_message_count(
+        self,
+        channel_id: str,
+        project_id: str = "default",
+        *,
+        detail_level: str = "full",
+    ) -> int:
         """Return the de-duplicated visible message count for a channel."""
-        cursor = await self._db.execute(
-            "SELECT message_id, channel_id, sender, sender_name, content, "
-            "timestamp, reply_to_id, mentions, metadata "
-            "FROM messages WHERE channel_id = ? AND project_id = ? ORDER BY timestamp ASC",
-            (channel_id, project_id),
+        messages = await self._get_channel_visible_messages(
+            channel_id,
+            detail_level=detail_level,
+            project_id=project_id,
         )
-        rows = await cursor.fetchall()
-        if not rows:
-            return 0
-        messages = [self._row_to_message_dict(row) for row in rows]
-        return len(self._dedupe_messages(messages))
+        return len(messages)
 
     async def get_unresolved_checkpoint_messages(
         self,
@@ -1646,6 +2214,9 @@ class ChatStore:
             preview = " ".join(detail.split())
             folded = dict(target)
             folded.update(entry)
+            # The folded stream is one UI timeline row. Preserve its creation
+            # timestamp so reconnect snapshots cannot move it around tools.
+            folded["timestamp"] = target.get("timestamp", entry.get("timestamp"))
             folded["detail"] = detail
             folded["summary"] = preview[:120].rstrip() + ("..." if len(preview) > 120 else "")
             merged[index_by_key[key]] = folded

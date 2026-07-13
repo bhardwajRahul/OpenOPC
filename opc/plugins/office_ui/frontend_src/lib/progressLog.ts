@@ -90,7 +90,9 @@ function mergeProgress(left: ProgressEntry, right: ProgressEntry): ProgressEntry
     // the same way as thinking streams.
     const detail = mergeText(left.detail ?? '', right.detail ?? '', 'thinking')
     return {
-      timestamp: right.timestamp,
+      // A stream occupies the timeline slot where it began. Deltas update the
+      // row in place instead of repeatedly re-sorting it around tool events.
+      timestamp: left.timestamp,
       type: left.type,
       summary: summarizeThinking(detail, right.summary || left.summary),
       detail: detail || undefined,
@@ -107,7 +109,7 @@ function mergeProgress(left: ProgressEntry, right: ProgressEntry): ProgressEntry
   if (left.type === 'tool_call') {
     const mergedDetail = mergeText(left.detail ?? '', right.detail ?? '', 'tool_call')
     return {
-      timestamp: right.timestamp,
+      timestamp: left.timestamp,
       type: 'tool_call',
       summary: right.summary || left.summary,
       detail: mergedDetail || undefined,
@@ -152,7 +154,7 @@ export function appendProgressEntry(
   if (isDuplicateProgress(last, normalized)) {
     return clampEntries([
       ...log.slice(0, actualIndex),
-      { ...last, timestamp: normalized.timestamp },
+      last,
       ...log.slice(actualIndex + 1),
     ], maxEntries)
   }

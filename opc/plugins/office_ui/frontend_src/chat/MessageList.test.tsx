@@ -1,54 +1,38 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
-import { buildNarrativeMessageItems, copyTextToClipboard, parseProjectUpdatePayload, shouldReleaseStickToBottomOnScroll } from './MessageList'
+import { buildNarrativeMessageItems, copyTextToClipboard, messageTimelineKey, parseProjectUpdatePayload } from './MessageList'
+import type { MessageScrollPolicy } from './MessageList'
 import type { ChatMessage } from '../types/chat'
+import { progressEntryKey } from '../lib/progressEntryKey'
 
-assert.equal(
-  shouldReleaseStickToBottomOnScroll({
-    previousScrollTop: 1200,
-    nextScrollTop: 900,
-    atBottom: false,
-    userScrolling: false,
-    programmaticScroll: false,
-  }),
-  true,
-  'scrollbar drag upward should release stick-to-bottom even without wheel/pointer events',
+const messageListSource = readFileSync(new URL('./MessageList.tsx', import.meta.url), 'utf8')
+const supportedScrollPolicies: MessageScrollPolicy[] = ['follow', 'initial-bottom', 'manual']
+assert.deepEqual(supportedScrollPolicies, ['follow', 'initial-bottom', 'manual'])
+assert.match(
+  messageListSource,
+  /export type MessageScrollPolicy = 'follow' \| 'initial-bottom' \| 'manual'/,
+  'MessageList must expose one unambiguous three-state scroll policy',
 )
+assert.match(messageListSource, /scrollPolicy = 'follow'/, 'main transcript behavior should default to follow mode')
+assert.doesNotMatch(messageListSource, /useVirtualizer/, 'chat transcript must use stable normal DOM rows')
+assert.doesNotMatch(messageListSource, /PROGRAMMATIC_SCROLL_GRACE_MS/, 'scroll behavior must not regress to timer-based intent guessing')
 
+const progressWithoutServerId = {
+  type: 'status_change' as const,
+  summary: 'Waiting for reviewer',
+  detail: 'Gate entered',
+  timestamp: 1234,
+}
 assert.equal(
-  shouldReleaseStickToBottomOnScroll({
-    previousScrollTop: 1200,
-    nextScrollTop: 900,
-    atBottom: false,
-    userScrolling: false,
-    programmaticScroll: true,
-  }),
-  false,
-  'programmatic scrolls should not release stick-to-bottom',
+  progressEntryKey(progressWithoutServerId),
+  progressEntryKey({ ...progressWithoutServerId }),
+  'progress identity must derive from stable event fields rather than its array position',
 )
-
-assert.equal(
-  shouldReleaseStickToBottomOnScroll({
-    previousScrollTop: 900,
-    nextScrollTop: 900,
-    atBottom: false,
-    userScrolling: true,
-    programmaticScroll: false,
-  }),
-  true,
-  'explicit user scroll state should release stick-to-bottom while away from bottom',
-)
-
-assert.equal(
-  shouldReleaseStickToBottomOnScroll({
-    previousScrollTop: 900,
-    nextScrollTop: 1200,
-    atBottom: true,
-    userScrolling: true,
-    programmaticScroll: false,
-  }),
-  false,
-  'scrolling back to bottom should keep follow mode available',
+assert.doesNotMatch(
+  progressEntryKey(progressWithoutServerId),
+  /:0$/,
+  'progress fallback identity must not carry a shifting array index',
 )
 
 const parsedUpdate = parseProjectUpdatePayload(JSON.stringify({
@@ -89,6 +73,81 @@ const baseMessage = (id: string, content: string, timestamp: number, sender = 's
   mentions: [],
   metadata: {},
 })
+
+assert.equal(
+  messageTimelineKey({
+    ...baseMessage('checkpoint-message', 'Approval needed', 10),
+    metadata: {
+      checkpoint_id: 'checkpoint-42',
+      canonical_turn_id: 'turn-ignored',
+      ui_message_id: 'ui-ignored',
+    },
+  }),
+  'checkpoint:checkpoint-42',
+  'checkpoint identity must win so pending/resolved updates reuse one row',
+)
+assert.equal(
+  messageTimelineKey({
+    ...baseMessage('assistant-final', 'Final answer', 20, 'assistant'),
+    metadata: { canonical_turn_id: 'turn-7', transcript_kind: 'runtime_v2_assistant' },
+  }),
+  'turn:assistant:turn-7',
+  'assistant draft and final surfaces must share the canonical turn key',
+)
+assert.equal(
+  messageTimelineKey({
+    ...baseMessage('user-message', 'Question', 30, 'user'),
+    metadata: { canonical_turn_id: 'turn-8', ui_message_id: 'ui-8' },
+  }),
+  'ui:ui-8',
+  'a persisted user turn must retain the optimistic ui_message_id key',
+)
+assert.equal(
+  messageTimelineKey({
+    ...baseMessage('optimistic-message', 'Local echo', 40, 'user'),
+    metadata: { ui_message_id: 'ui-9' },
+  }),
+  'ui:ui-9',
+  'optimistic and persisted user echoes must share ui_message_id identity',
+)
+assert.equal(
+  messageTimelineKey(baseMessage('persistent-message', 'Stored message', 50, 'assistant')),
+  'message:persistent-message',
+  'messages without stronger runtime identity must fall back to the persistent id',
+)
+assert.equal(
+  messageTimelineKey({
+    ...baseMessage('higher-priority-result', 'Final answer', 55, 'assistant'),
+    metadata: {
+      canonical_turn_id: 'turn-7',
+      transcript_kind: 'child_task_result',
+      ui_timeline_id: 'turn:assistant:turn-7',
+    },
+  }),
+  'turn:assistant:turn-7',
+  'a semantic result replacement must keep the mounted native-final/draft slot',
+)
+
+const sharedCompanyTurn = 'company-turn-1'
+const companyTurnKeys = [
+  messageTimelineKey({
+    ...baseMessage('runtime-context', 'Execution context', 60),
+    metadata: { kind: 'runtime_v2_user_turn', canonical_turn_id: sharedCompanyTurn },
+  }),
+  messageTimelineKey({
+    ...baseMessage('company-stream-1', 'First company surface', 61, 'assistant'),
+    metadata: { kind: 'runtime_v2_company_assistant', canonical_turn_id: sharedCompanyTurn },
+  }),
+  messageTimelineKey({
+    ...baseMessage('company-stream-2', 'Second company surface', 62, 'assistant'),
+    metadata: { kind: 'runtime_v2_company_assistant', canonical_turn_id: sharedCompanyTurn },
+  }),
+  messageTimelineKey({
+    ...baseMessage('role-result', 'Role result', 63, 'assistant'),
+    metadata: { kind: 'company_role_result', canonical_turn_id: sharedCompanyTurn },
+  }),
+]
+assert.equal(new Set(companyTurnKeys).size, companyTurnKeys.length, 'distinct company rows sharing a turn need unique DOM keys')
 
 const narrativeItems = buildNarrativeMessageItems([
   baseMessage('m1', '[Company:cto::execute::abc] starting Research source reliability', 1000),
@@ -194,4 +253,4 @@ if (originalDocument) {
   delete (globalThis as any).document
 }
 
-console.log('MessageList.test.tsx: OK (scroll + narrative timeline helpers)')
+console.log('MessageList.test.tsx: OK (scroll contract + stable timeline identity + narrative helpers)')

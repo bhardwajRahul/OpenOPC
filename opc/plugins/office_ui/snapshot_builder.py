@@ -16,10 +16,16 @@ import json
 import re
 import time
 import uuid
-from typing import Any, Literal, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from loguru import logger
 from opc.core.models import normalize_role_runtime_status
+from opc.core.transcript_visibility import (
+    FULL_DETAIL_ONLY_TRANSCRIPT_KINDS,
+    TranscriptDetailLevel,
+    normalize_transcript_detail_level,
+    transcript_metadata_visible,
+)
 from opc.layer2_organization.phase import (
     DONE_PHASES,
     IN_PROGRESS_PHASES,
@@ -118,14 +124,7 @@ def _session_message_ui_identity(message: Any) -> tuple[str, float, dict[str, An
     return canonical_id or str(getattr(message, "message_id", "") or ""), timestamp, ui_meta
 
 
-TranscriptDetailLevel = Literal["summary", "full"]
-
-_FULL_DETAIL_ONLY_TRANSCRIPT_KINDS: frozenset[str] = frozenset({
-    "runtime_v2_user_turn",
-    "runtime_v2_intermediate_assistant",
-    "runtime_v2_company_assistant",
-    "runtime_v2_tool_output",
-})
+_FULL_DETAIL_ONLY_TRANSCRIPT_KINDS = FULL_DETAIL_ONLY_TRANSCRIPT_KINDS
 
 _TRANSCRIPT_DUPLICATE_KIND_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({
@@ -208,10 +207,7 @@ def _strip_narrative_title_prefix(content: str) -> str:
 
 
 def _normalize_transcript_detail_level(value: Any) -> TranscriptDetailLevel:
-    normalized = str(value or "").strip().lower()
-    if normalized == "full":
-        return "full"
-    return "summary"
+    return normalize_transcript_detail_level(value)
 
 
 def _transcript_message_kind(message: Any) -> str:
@@ -229,13 +225,7 @@ def _transcript_message_hidden_from_ui(
     detail_level: TranscriptDetailLevel = "summary",
 ) -> bool:
     metadata = dict(getattr(message, "metadata", {}) or {})
-    kind = str(metadata.get("kind", "") or "").strip()
-    if metadata.get("company_final_turn"):
-        # The role's final reply of a company turn is the user-visible result
-        # (intake/aggregate turns have no engine-recorded result surface, so
-        # hiding this would drop the reply from the chat entirely).
-        return False
-    return detail_level != "full" and kind in _FULL_DETAIL_ONLY_TRANSCRIPT_KINDS
+    return not transcript_metadata_visible(metadata, detail_level=detail_level)
 
 
 def _render_text_parts(parts: list[Any]) -> str:
@@ -1168,7 +1158,14 @@ def _prefer_duplicate_message(left: dict[str, Any], right: dict[str, Any]) -> tu
     return right, left
 
 
-def _collapse_adjacent_transcript_duplicates(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def collapse_adjacent_transcript_duplicates(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse duplicate rendered result surfaces in chronological order.
+
+    This is public within the Office UI package because transcript pagination
+    formats raw database chunks incrementally.  Reusing the renderer's exact
+    collapse rule at chunk boundaries keeps pagination and full snapshots
+    identical.
+    """
     collapsed: list[dict[str, Any]] = []
     for message in messages:
         if not collapsed:
@@ -1236,7 +1233,7 @@ def build_transcript_ui_messages(
             "metadata": dict(formatted.get("metadata", {}) or {}),
         })
 
-    collapsed_messages = _collapse_adjacent_transcript_duplicates(formatted_messages)
+    collapsed_messages = collapse_adjacent_transcript_duplicates(formatted_messages)
     normalized_detail_level = _normalize_transcript_detail_level(detail_level)
     if normalized_detail_level == "full":
         return collapsed_messages

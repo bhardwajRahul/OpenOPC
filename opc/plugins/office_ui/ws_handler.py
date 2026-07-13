@@ -40,6 +40,7 @@ from opc.core.org_config import (
     write_org_index,
 )
 from opc.core.models import normalize_role_runtime_status
+from opc.core.transcript_visibility import rendered_transcript_metadata_visible
 from opc.presentation.kanban import build_company_board_columns
 from opc.layer2_organization.phase import (
     kanban_column,
@@ -77,6 +78,7 @@ from opc.plugins.office_ui.services import (
 from opc.plugins.office_ui.snapshot_builder import (
     STATUS_TO_COLUMN,
     _build_company_runtime_control_by_task,
+    collapse_adjacent_transcript_duplicates,
     _build_session_context_preview,
     _extract_markdown_text,
     _sanitize_ui_message_dict,
@@ -947,11 +949,8 @@ class WSHandler:
 
     @staticmethod
     def _message_visible_in_detail_level(message: dict[str, Any], detail_level: str) -> bool:
-        normalized_detail_level = _normalize_transcript_detail_level(detail_level)
-        if normalized_detail_level == "full":
-            return True
         metadata = dict(message.get("metadata", {}) or {})
-        return str(metadata.get("detail_visibility", "summary")).strip() != "full"
+        return rendered_transcript_metadata_visible(metadata, detail_level=detail_level)
 
     @classmethod
     def _filter_ui_messages_for_detail_level(
@@ -989,25 +988,86 @@ class WSHandler:
         channel_id = f"session:{task_id}"
         page_loader = getattr(store, "get_session_transcript_page", None)
         if callable(page_loader):
-            before_dt = datetime.fromtimestamp(before_timestamp) if before_timestamp is not None else None
-            raw_page = page_loader(
-                session_id,
-                limit=limit,
-                before_created_at=before_dt,
-                before_message_id=before_message_id,
-                detail_level=_normalize_transcript_detail_level(detail_level),
+            normalized_limit = max(1, min(int(limit), 500))
+            normalized_detail_level = _normalize_transcript_detail_level(detail_level)
+            # A database-visible transcript row can still disappear when the
+            # renderer finds no content, and adjacent result surfaces can
+            # collapse to one UI row.  Page raw rows in bounded chunks until
+            # we have one *rendered* look-ahead row or exhaust the transcript.
+            # This makes has_more describe the UI timeline rather than the SQL
+            # row set and prevents an empty raw page from stalling history.
+            chunk_limit = normalized_limit
+            raw_before_dt = (
+                datetime.fromtimestamp(before_timestamp)
+                if before_timestamp is not None
+                else None
             )
-            page = await raw_page if inspect.isawaitable(raw_page) else raw_page
-            transcript_page = list((page or {}).get("messages", []) or [])
-            formatted_page = build_transcript_ui_messages(
-                transcript_page,
-                channel_id=channel_id,
-                task_id=task_id,
-                detail_level=_normalize_transcript_detail_level(detail_level),
+            raw_before_id = before_message_id
+            seen_raw_cursors: set[tuple[datetime, str]] = set()
+            formatted_messages: list[dict[str, Any]] = []
+            total_count = 0
+            raw_has_more = False
+
+            while True:
+                raw_page = page_loader(
+                    session_id,
+                    limit=chunk_limit,
+                    before_created_at=raw_before_dt,
+                    before_message_id=raw_before_id,
+                    detail_level=normalized_detail_level,
+                )
+                page = await raw_page if inspect.isawaitable(raw_page) else raw_page
+                transcript_chunk = list((page or {}).get("messages", []) or [])
+                total_count = max(
+                    total_count,
+                    int((page or {}).get("total_count", 0) or 0),
+                )
+                raw_has_more = bool((page or {}).get("has_more", False))
+                if not transcript_chunk:
+                    break
+
+                formatted_chunk = build_transcript_ui_messages(
+                    transcript_chunk,
+                    channel_id=channel_id,
+                    task_id=task_id,
+                    detail_level=normalized_detail_level,
+                )
+                formatted_messages = collapse_adjacent_transcript_duplicates([
+                    *formatted_chunk,
+                    *formatted_messages,
+                ])
+                if len(formatted_messages) > normalized_limit:
+                    return (
+                        formatted_messages[-normalized_limit:],
+                        max(total_count, len(formatted_messages)),
+                        True,
+                    )
+                if not raw_has_more:
+                    break
+
+                oldest_message = transcript_chunk[0].get("message")
+                oldest_created_at = getattr(oldest_message, "created_at", None)
+                oldest_message_id = str(
+                    getattr(oldest_message, "message_id", "") or ""
+                ).strip()
+                if not isinstance(oldest_created_at, datetime) or not oldest_message_id:
+                    break
+                next_cursor = (oldest_created_at, oldest_message_id)
+                if next_cursor in seen_raw_cursors:
+                    break
+                seen_raw_cursors.add(next_cursor)
+                raw_before_dt, raw_before_id = next_cursor
+                # Small client pages should not require one SQL round-trip per
+                # empty row. Start at the requested size so duplicate/empty
+                # boundaries are exact, then grow only while looking through
+                # rows which did not fill the rendered page.
+                chunk_limit = min(500, max(chunk_limit + 1, chunk_limit * 2))
+
+            return (
+                formatted_messages[-normalized_limit:],
+                max(total_count, len(formatted_messages)),
+                raw_has_more,
             )
-            total_count = int((page or {}).get("total_count", len(formatted_page)) or 0)
-            has_more = bool((page or {}).get("has_more", False))
-            return formatted_page, max(total_count, len(formatted_page)), has_more
 
         transcript_loader = getattr(store, "get_session_transcript", None)
         if not callable(transcript_loader):
@@ -5497,38 +5557,28 @@ class WSHandler:
         )
 
         try:
-            messages = await self.chat_store.get_channel_messages_page(
+            cache_page = await self.chat_store.get_channel_messages_page_info(
                 channel_id,
                 limit=request_limit,
                 before_timestamp=before_timestamp,
                 before_message_id=before_message_id,
+                detail_level=detail_level,
                 project_id=project_id,
             )
+            messages = list(cache_page.get("messages", []) or [])
+            visible_cache_count = int(cache_page.get("total_count", len(messages)) or 0)
+            cache_has_more = bool(cache_page.get("has_more", False))
             messages = self._filter_ui_messages_for_detail_level(messages, detail_level)
             messages = [_sanitize_ui_message_dict(message) for message in messages]
-        except Exception:
-            messages = []
-        try:
-            if transcript_total_count:
-                visible_cache_count = transcript_total_count
-            else:
-                visible_cache_count = len(self._filter_ui_messages_for_detail_level(
-                    await self.chat_store.get_channel_messages(
-                        channel_id,
-                        limit=max(request_limit * 8, 500),
-                        project_id=project_id,
-                    ),
-                    detail_level,
-                ))
         except Exception as exc:
             if self._is_expected_shutdown_error(exc):
-                logger.debug(f"session_detail: visible count skipped during shutdown for {task_id}")
+                logger.debug(f"session_detail: cache page skipped during shutdown for {task_id}")
                 return
+            messages = []
             visible_cache_count = len(messages)
+            cache_has_more = False
         total_message_count = max(transcript_total_count, visible_cache_count, len(messages))
-        has_more = transcript_has_more or (
-            before_timestamp is None and total_message_count > len(messages)
-        )
+        has_more = transcript_has_more or cache_has_more
 
         task_meta = task.metadata if isinstance(getattr(task, "metadata", None), dict) else {}
         handoff_context = _extract_markdown_text(task_meta.get("handoff_context"), max_chars=None)

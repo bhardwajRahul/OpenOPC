@@ -65,6 +65,10 @@ from opc.core.models import (
     normalize_role_runtime_status,
 )
 from opc.core.models import Phase
+from opc.core.transcript_visibility import (
+    normalize_transcript_detail_level,
+    transcript_visibility_sql,
+)
 from opc.layer2_organization.phase import (
     DONE_PHASES,
     IN_PROGRESS_PHASES,
@@ -6192,20 +6196,17 @@ class OPCStore:
     ) -> dict[str, Any]:
         assert self._db
         normalized_limit = max(1, min(int(limit), 500))
-        normalized_detail_level = str(detail_level or "summary").strip().lower()
-        hidden_kinds = () if normalized_detail_level == "full" else (
-            "runtime_v2_user_turn",
-            "runtime_v2_assistant",
+        normalized_detail_level = normalize_transcript_detail_level(detail_level)
+        visibility_sql, visibility_params = transcript_visibility_sql(
+            detail_level=normalized_detail_level,
         )
         query = (
             "SELECT * FROM session_messages "
             "WHERE session_id = ? AND summary_flag = 0 "
         )
         params: list[Any] = [session_id]
-        if hidden_kinds:
-            placeholders = ",".join("?" for _ in hidden_kinds)
-            query += f"AND COALESCE(json_extract(metadata, '$.kind'), '') NOT IN ({placeholders}) "
-            params.extend(hidden_kinds)
+        query += visibility_sql
+        params.extend(visibility_params)
         normalized_before_id = str(before_message_id or "").strip()
         if before_created_at is not None:
             before_iso = before_created_at.isoformat()
@@ -6246,10 +6247,8 @@ class OPCStore:
             "WHERE session_id = ? AND summary_flag = 0 "
         )
         count_params: list[Any] = [session_id]
-        if hidden_kinds:
-            placeholders = ",".join("?" for _ in hidden_kinds)
-            count_query += f"AND COALESCE(json_extract(metadata, '$.kind'), '') NOT IN ({placeholders})"
-            count_params.extend(hidden_kinds)
+        count_query += visibility_sql
+        count_params.extend(visibility_params)
         async with self._db.execute(count_query, count_params) as cursor:
             row = await cursor.fetchone()
         total_count = int(row[0] or 0) if row else 0

@@ -156,7 +156,7 @@ export function AgentProgressBlock({ entries, agentStatus, currentTool, toolElap
             const cfg = ENTRY_CONFIG[entry.type] || ENTRY_CONFIG.status_change
 
             return (
-              <div key={progressEntryKey(entry, hiddenCount + i)} className={`ptl-entry${isLast ? ' ptl-entry-last' : ''}`}>
+              <div key={progressEntryKey(entry)} className={`ptl-entry${isLast ? ' ptl-entry-last' : ''}`}>
                 <div className="ptl-connector">
                   <div className="ptl-dot" style={{ color: cfg.color }}>
                     {cfg.icon}

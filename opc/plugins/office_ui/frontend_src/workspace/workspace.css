@@ -665,19 +665,51 @@
   overflow: hidden;
 }
 
-.ctx-body > .msg-list {
+.ctx-body > .msg-list,
+.ctx-body > .msg-list-shell {
   min-height: 0;
 }
 
 .ctx-work-item-progress {
-  flex-shrink: 0;
+  flex: 0 0 84px;
+  height: 84px;
+  min-height: 84px;
   padding: 12px 12px 0;
-  overflow-y: auto;
-  overflow-x: hidden;
-  max-height: 50vh;
+  overflow: hidden;
   position: relative;
   z-index: 1;
   background: var(--bg-elevated);
+}
+
+.ctx-work-item-progress .wi-progress-card {
+  box-sizing: border-box;
+  height: 72px;
+  padding: 10px 12px;
+  gap: 7px;
+  overflow: hidden;
+}
+
+.ctx-work-item-progress .wi-progress-pipeline {
+  min-width: 0;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.ctx-work-item-progress .wi-progress-pipeline::-webkit-scrollbar {
+  display: none;
+}
+
+.ctx-work-item-progress .wi-projection-group {
+  flex: 0 0 auto;
+}
+
+.ctx-work-item-progress .wi-progress-pipeline-empty {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 22px;
+  white-space: nowrap;
 }
 
 .ctx-multi-grid {
@@ -1863,12 +1895,20 @@
    TaskDetailView — linked session messages
    ═══════════════════════════════════════════════════════ */
 .task-detail-linked-messages {
-  max-height: 400px;
-  overflow-y: auto;
+  height: min(400px, 55vh);
+  min-height: 220px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 4px 0;
   background: var(--bg);
+}
+
+.task-detail-linked-messages > .msg-list-shell {
+  flex: 1;
+  min-height: 0;
 }
 .task-detail-empty-hint {
   color: var(--text-secondary);
