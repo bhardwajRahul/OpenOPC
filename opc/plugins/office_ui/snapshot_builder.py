@@ -2630,23 +2630,16 @@ async def _build_company_runtime_control_by_task(
         ]
         checkpoint = identity.checkpoint
 
-        def _task_status_value(task: Any) -> str:
-            status = getattr(task, "status", "")
-            if hasattr(status, "value"):
-                return str(status.value or "").strip().lower()
-            return str(status or "").strip().lower().removeprefix("taskstatus.")
-
-        non_terminal_group = [
-            task for task in group
-            if _task_status_value(task) not in {"done", "failed", "cancelled"}
-        ]
         # Persisted RUNNING is only a projection.  The controller-local
         # execution registry is the sole proof that this process still owns a
-        # coroutine capable of monitoring and persisting the run.
+        # coroutine capable of monitoring and persisting the run.  Driver
+        # ownership can deliberately sit on a terminal work-item envelope
+        # while the resumed scheduler is still active, so Task.status must not
+        # filter this lookup.
         runtime_is_live = getattr(engine, "_task_runtime_is_live", None)
         has_running_task = False
         if callable(runtime_is_live):
-            for task in non_terminal_group:
+            for task in group:
                 live_result = runtime_is_live(task)
                 if inspect.isawaitable(live_result):
                     live_result = await live_result
@@ -2657,19 +2650,31 @@ async def _build_company_runtime_control_by_task(
             str((getattr(task, "metadata", {}) or {}).get("company_runtime_stop_state", "") or "").strip()
             in {"suspending", "suspended", "resuming_after_suspending"}
             and bool(str((getattr(task, "metadata", {}) or {}).get("company_runtime_stop_marked_at", "") or "").strip())
-            for task in non_terminal_group
+            for task in group
         )
         any_held_suspended = any(
             str((getattr(task, "metadata", {}) or {}).get("dispatch_hold", "") or "").strip()
             == "company_runtime_suspended"
-            for task in non_terminal_group
+            for task in group
         )
         any_resuming = any(
             str((getattr(task, "metadata", {}) or {}).get("company_runtime_stop_state", "") or "").strip() == "resuming"
-            for task in non_terminal_group
+            for task in group
         )
         checkpoint_status = str(getattr(checkpoint, "status", "") or "").strip().lower() if checkpoint is not None else ""
-        if any_resuming or checkpoint_status == "resuming":
+        # ``resuming`` is the durable checkpoint claim for the whole resumed
+        # execution, not merely a short UI transition.  Once the controller
+        # registry proves that execution ownership exists, the runtime is
+        # stoppable and must project as running until that ownership ends.
+        if checkpoint_status == "pending":
+            state = "suspended"
+        elif checkpoint_status == "resuming" and (
+            any_held_suspended or any_stop_in_progress
+        ):
+            state = "suspending"
+        elif checkpoint_status == "resuming" and has_running_task:
+            state = "running"
+        elif any_resuming or checkpoint_status == "resuming":
             state = "resuming"
         elif checkpoint is not None:
             state = "suspended"
@@ -2678,7 +2683,7 @@ async def _build_company_runtime_control_by_task(
             and any(
                 str((getattr(task, "metadata", {}) or {}).get("company_runtime_stop_state", "") or "").strip()
                 in {"suspending", "resuming_after_suspending"}
-                for task in non_terminal_group
+                for task in group
             )
         ):
             state = "suspending"

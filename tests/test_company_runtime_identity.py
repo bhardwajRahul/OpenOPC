@@ -250,6 +250,11 @@ def test_work_item_chat_resume_uses_canonical_ui_anchor_as_engine_origin() -> No
         assert call.kwargs["session_id"] == "runtime-session"
         assert call.kwargs["origin_task_id"] == "ui-anchor"
         assert handler._session_to_task["runtime-session"] == "ui-anchor"
+        handler._set_company_runtime_control.assert_awaited_once_with(
+            target,
+            state="resuming",
+            checkpoint_id="checkpoint-1",
+        )
         handler.on_kanban_changed.assert_awaited_once_with(engine=run_engine)
 
     asyncio.run(scenario())

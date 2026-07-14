@@ -802,6 +802,24 @@ async def test_resume_candidates_use_nonterminal_work_item_over_terminal_task(
                         "phase": Phase.RUNNING.value,
                     }
                 ],
+                "task_snapshots": [
+                    {
+                        "task_id": task.id,
+                        "status": TaskStatus.DONE.value,
+                        "assigned_to": "executor",
+                        "assigned_external_agent": "",
+                        "selected_execution_agent": "native",
+                        "work_item_id": work_item.work_item_id,
+                        "work_item": {
+                            "work_item_id": work_item.work_item_id,
+                            "phase": Phase.RUNNING.value,
+                            "role_id": "executor",
+                            "seat_id": "seat::executor",
+                            "role_runtime_session_id": "",
+                            "metadata": {},
+                        },
+                    }
+                ],
             },
             resume_task_ids={task.id},
         )
@@ -1062,7 +1080,9 @@ async def test_successful_checkpoint_handoff_reopens_cancelled_ui_anchor(
         await store.save_execution_checkpoint(checkpoint)
         engine = OPCEngine(project_id="project-a")
         engine.store = store
-        engine.company_executor = SimpleNamespace()
+        engine.company_executor = SimpleNamespace(
+            _notify_kanban_changed=AsyncMock(),
+        )
         engine._prepare_company_runtime_tasks_for_resume = AsyncMock(
             return_value=[runtime_task]
         )
@@ -1087,6 +1107,7 @@ async def test_successful_checkpoint_handoff_reopens_cancelled_ui_anchor(
         handed_off_tasks, driver_ownership = handed_off
         assert handed_off_tasks == [runtime_task]
         assert driver_ownership is not None
+        engine.company_executor._notify_kanban_changed.assert_awaited_once_with()
         driver_ownership.release()
         assert still_cancelled is not None
         assert still_cancelled.status == TaskStatus.CANCELLED
@@ -1106,6 +1127,63 @@ async def test_successful_checkpoint_handoff_reopens_cancelled_ui_anchor(
         )
         assert reopened is not None and reopened.status == TaskStatus.IDLE
         assert len(persisted_checkpoints) == 1
+    finally:
+        await store.close()
+
+
+@_async_test
+async def test_failed_checkpoint_handoff_does_not_publish_running_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = OPCStore(tmp_path / "tasks.db")
+    await store.initialize()
+    try:
+        runtime_task = _runtime_task(
+            task_id="runtime-task",
+            status=TaskStatus.BLOCKED,
+        )
+        await store.save_task(runtime_task)
+        checkpoint = ExecutionCheckpoint(
+            project_id="project-a",
+            session_id="root-session",
+            checkpoint_type="company_runtime_interrupted",
+            task_id=runtime_task.id,
+            payload={
+                "task_ids": [runtime_task.id],
+                "parent_session_id": "root-session",
+            },
+        )
+        await store.save_execution_checkpoint(checkpoint)
+        engine = OPCEngine(project_id="project-a")
+        engine.store = store
+        engine.company_executor = SimpleNamespace(
+            _notify_kanban_changed=AsyncMock(),
+        )
+        engine._prepare_company_runtime_tasks_for_resume = AsyncMock(
+            side_effect=RuntimeError("prepare failed"),
+        )
+
+        with pytest.raises(RuntimeError, match="prepare failed"):
+            await engine._handoff_company_suspend_checkpoint(
+                checkpoint,
+                payload=dict(checkpoint.payload),
+                parent_session_id="root-session",
+                tasks=[runtime_task],
+            )
+
+        engine.company_executor._notify_kanban_changed.assert_not_awaited()
+        assert not engine._active_task_run_registry.is_active(
+            "project-a",
+            runtime_task.id,
+        )
+        pending = await store.get_execution_checkpoints(
+            project_id="project-a",
+            session_id="root-session",
+            checkpoint_types=["company_runtime_interrupted"],
+            statuses=["pending"],
+        )
+        assert len(pending) == 1
+        assert pending[0].payload.get("resume_state") == "failed_before_handoff"
     finally:
         await store.close()
 

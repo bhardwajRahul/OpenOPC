@@ -28,6 +28,7 @@ from opc.core.models import (
     ApprovalAction,
     ApprovalDecision,
     DelegationRoleSession,
+    ExternalSession,
     RiskLevel,
     Task,
     TaskResult,
@@ -357,6 +358,77 @@ class BrokerRestorePrefersRoleStateTests(unittest.IsolatedAsyncioTestCase):
         await self.broker._restore_session_resume_from_store(adapter, task)
 
         self.assertNotEqual(adapter.config.session_id, "thread-codex-only")
+
+    async def test_restore_never_treats_synthetic_monitor_identity_as_provider_token(self) -> None:
+        synthetic_id = "codex:proj1:task-new"
+        await self.store.update_role_session_adapter_state(
+            self.role_session_id,
+            "codex",
+            {
+                "resume_session_id": synthetic_id,
+                "provider_session_id": synthetic_id,
+            },
+        )
+        await self.store.save_external_session(
+            ExternalSession(
+                agent_type="codex",
+                project_id="proj1",
+                session_id=synthetic_id,
+                opc_session_id=self.role_session_id,
+                task_id="task-new",
+                workspace_path="/tmp/ws",
+                run_mode="exec",
+                status="working",
+                metadata={},
+            )
+        )
+        adapter = _MiniAdapter(agent_type="codex", can_resume_blank=False)
+        task = self._task()
+
+        await self.broker._restore_session_resume_from_store(adapter, task)
+
+        self.assertNotEqual(adapter.config.session_mode, "resume")
+        self.assertEqual(adapter.config.session_id, "")
+        self.assertNotIn("external_resume_session_id", task.metadata)
+
+    async def test_restore_rejects_failed_early_provider_stream_token(self) -> None:
+        token = "thread-failed"
+        await self.store.update_role_session_adapter_state(
+            self.role_session_id,
+            "codex",
+            {
+                "resume_session_id": token,
+                "provider_session_id": token,
+                "last_task_id": "task-new",
+                "source": "provider_stream",
+                "status": "working",
+            },
+        )
+        await self.store.save_external_session(ExternalSession(
+            agent_type="codex",
+            project_id="proj1",
+            session_id=token,
+            opc_session_id=self.role_session_id,
+            task_id="task-new",
+            workspace_path="/tmp/ws",
+            run_mode="exec",
+            status="failed",
+            metadata={
+                "resume_session_id": token,
+                "provider_session_id": token,
+            },
+        ))
+        adapter = _MiniAdapter(agent_type="codex", can_resume_blank=False)
+        task = self._task()
+
+        await self.broker._restore_session_resume_from_store(adapter, task)
+
+        self.assertNotEqual(adapter.config.session_mode, "resume")
+        self.assertEqual(adapter.config.session_id, "")
+        self.assertIsNone(await self.store.get_role_session_adapter_state(
+            self.role_session_id,
+            "codex",
+        ))
 
 
 if __name__ == "__main__":

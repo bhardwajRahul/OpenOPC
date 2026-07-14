@@ -5356,10 +5356,13 @@ class CompanyWorkItemExecutor:
             target_status_or_phase=Phase.RUNNING,
             reason="pre_execution_claim",
         )
-        if task.metadata.get("force_native_execution"):
-            task.assigned_external_agent = None
-        elif self.agent_selector:
+        if self.agent_selector:
+            # The selector also owns checkpoint attempt pins.  Forced-native
+            # work must pass through it so a resumed native pin is validated
+            # and consumed instead of leaking into a later dispatch.
             await self.agent_selector(task, role)
+        elif task.metadata.get("force_native_execution"):
+            task.assigned_external_agent = None
         else:
             if not task.assigned_external_agent:
                 strategy = task.metadata.get("work_item_execution_strategy", "auto")

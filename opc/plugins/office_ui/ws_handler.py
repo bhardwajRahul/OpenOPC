@@ -7985,7 +7985,13 @@ class WSHandler:
         async with lock:
             try:
                 try:
-                    await self._set_company_runtime_control(target, state="resuming")
+                    await self._set_company_runtime_control(
+                        target,
+                        state="resuming",
+                        checkpoint_id=str(
+                            getattr(checkpoint, "checkpoint_id", "") or ""
+                        ).strip(),
+                    )
                 except Exception:
                     logger.opt(exception=True).debug("failed to broadcast company suspend reply routing state")
 

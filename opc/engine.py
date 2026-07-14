@@ -175,6 +175,13 @@ from opc.layer3_agent.native_agent import NativeAgent
 from opc.layer3_agent.prompt_harness.builder import _final_decider_role_id, _memory_skill_user_facing
 from opc.layer3_agent.adapters.registry import AdapterRegistry
 from opc.layer3_agent.external_broker import ExternalAgentBroker
+from opc.layer3_agent.external_session_identity import (
+    external_session_matches_provider_token,
+    external_session_status_allows_resume,
+    is_provider_session_token,
+    provider_token_from_external_session,
+    select_best_external_resume_session,
+)
 from opc.layer4_tools.registry import ToolRegistry, ToolDefinition
 from opc.layer4_tools.shell import create_shell_tool, create_shell_tools
 from opc.layer4_tools.file_ops import create_file_tools
@@ -4661,6 +4668,70 @@ class OPCEngine:
     async def _assign_task_execution_agent(self, task: Task, role: Any | None = None) -> str | None:
         assert self.org_engine
         task.metadata = dict(task.metadata)
+        resume_pin = dict(
+            task.metadata.get("_company_runtime_resume_execution_agent_pin", {})
+            or {}
+        )
+        if resume_pin:
+            available_for_audit: list[str] = []
+            selected_name = normalize_recruitment_agent_choice(
+                resume_pin.get("selected_execution_agent"),
+                default=(
+                    str(resume_pin.get("assigned_external_agent", "") or "").strip()
+                    or "native"
+                ),
+            ) or "native"
+            assigned_name = str(
+                resume_pin.get("assigned_external_agent", "") or ""
+            ).strip()
+            if selected_name == "native":
+                if assigned_name:
+                    raise RuntimeError(
+                        f"company runtime resume agent pin is inconsistent for task {task.id}"
+                    )
+                selected: str | None = None
+            else:
+                if assigned_name and assigned_name != selected_name:
+                    raise RuntimeError(
+                        f"company runtime resume agent pin is inconsistent for task {task.id}"
+                    )
+                available_for_audit = self._available_external_agents()
+                if selected_name not in available_for_audit:
+                    raise RuntimeError(
+                        "company runtime resume requires unavailable external agent "
+                        f"{selected_name!r} for task {task.id}"
+                    )
+                selected = selected_name
+            task.assigned_external_agent = selected
+            task.metadata["selected_execution_agent"] = selected_name
+            task.metadata["preferred_external_agent"] = selected
+            task.metadata["agent_selection"] = {
+                "selected": selected_name,
+                "strategy": (
+                    WorkItemExecutionStrategy.NATIVE.value
+                    if selected_name == "native"
+                    else WorkItemExecutionStrategy.EXTERNAL.value
+                ),
+                "role_id": task.assigned_to
+                or task.metadata.get("work_item_role_id", ""),
+                "decision_reason": "company_runtime_resume_checkpoint_pin",
+                "selection_source": "company_runtime_resume_checkpoint",
+                "checkpoint_id": str(resume_pin.get("checkpoint_id", "") or ""),
+                "original_selection_source": str(
+                    resume_pin.get("selected_execution_agent_source", "") or ""
+                ),
+                "available_external_agents": (
+                    available_for_audit
+                ),
+            }
+            # The pin belongs to this dispatch attempt.  Persisting the
+            # resulting choice is useful audit state, but leaving the pin set
+            # would silently turn an adaptive role into a permanent lock.
+            task.metadata.pop(
+                "_company_runtime_resume_execution_agent_pin",
+                None,
+            )
+            return selected
         locked_agent = normalize_recruitment_agent_choice(
             task.metadata.get("selected_execution_agent"),
             default=("native" if not str(task.assigned_external_agent or "").strip() else str(task.assigned_external_agent or "").strip()),
@@ -4723,6 +4794,16 @@ class OPCEngine:
         preferred_adapter = self.adapter_registry.get(preferred)
         if not preferred_adapter:
             return ordered
+
+        selection = dict(task.metadata.get("agent_selection", {}) or {})
+        if (
+            str(selection.get("selection_source", "") or "").strip()
+            == "company_runtime_resume_checkpoint"
+        ):
+            # Resume owns one exact execution backend.  Returning alternates
+            # here would undermine the checkpoint pin after the selector has
+            # consumed its one-shot marker.
+            return [(preferred, preferred_adapter)]
 
         remaining = [(name, adapter) for name, adapter in ordered if name != preferred]
         return [(preferred, preferred_adapter), *remaining]
@@ -5100,20 +5181,54 @@ class OPCEngine:
         return [str(item) for item in progress[-limit:]]
 
     @staticmethod
-    def _external_resume_status_allows_token(status: Any) -> bool:
-        normalized = str(status or "").strip().lower()
-        return normalized not in {
-            "failed",
-            "cancelled",
-            "denied",
-            "rejected",
-            "hard_timeout",
-            "idle_timeout",
-            "startup_timeout",
-        }
+    def _task_effective_execution_agent_identity(
+        task: Task,
+    ) -> tuple[str, str, str]:
+        """Return the backend that this Task attempt actually executes on.
+
+        Recruitment's ``selected_execution_agent`` is policy/default input and
+        can remain unchanged after an unlocked adaptive selection.  Runtime
+        assignment and its audit record are the attempt identity; recruitment
+        metadata is only a fallback for tasks that have not recorded either.
+        """
+
+        metadata = dict(task.metadata or {})
+        selection = dict(metadata.get("agent_selection", {}) or {})
+        selection_agent = normalize_recruitment_agent_choice(
+            selection.get("selected")
+        )
+        assigned_agent = normalize_recruitment_agent_choice(
+            task.assigned_external_agent
+        )
+        if bool(metadata.get("force_native_execution")) or selection_agent == "native":
+            selected_agent = "native"
+            assigned_external_agent = ""
+        elif assigned_agent and assigned_agent != "native":
+            selected_agent = assigned_agent
+            assigned_external_agent = assigned_agent
+        elif selection_agent and selection_agent != "native":
+            selected_agent = selection_agent
+            assigned_external_agent = selection_agent
+        else:
+            selected_agent = normalize_recruitment_agent_choice(
+                metadata.get("selected_execution_agent"),
+                default="native",
+            ) or "native"
+            assigned_external_agent = (
+                selected_agent if selected_agent != "native" else ""
+            )
+        selection_source = str(
+            selection.get("selection_source")
+            or metadata.get("selected_execution_agent_source")
+            or ""
+        ).strip()
+        return selected_agent, assigned_external_agent, selection_source
 
     async def _external_resume_snapshot_for_task(self, task: Task) -> dict[str, Any]:
-        session = await self._load_latest_external_session_for_task(task)
+        session = (
+            await self._load_best_external_resume_session_for_task(task)
+            or await self._load_latest_external_session_for_task(task)
+        )
         if not session:
             return {}
         metadata = dict(getattr(session, "metadata", {}) or {})
@@ -5162,8 +5277,6 @@ class OPCEngine:
             company_profile = company_profile or str(metadata.get("company_profile", "") or "").strip()
             role_session_id = str(metadata.get("delegation_role_session_id", "") or "").strip()
             seat_state_id = str(metadata.get("delegation_seat_state_id", "") or "").strip()
-            if role_session_id:
-                role_runtime_session_ids.append(role_session_id)
             if seat_state_id:
                 seat_state_ids.append(seat_state_id)
             raw_runtime_resume = task.context_snapshot.get("runtime_resume", {}) if isinstance(task.context_snapshot, dict) else {}
@@ -5174,15 +5287,37 @@ class OPCEngine:
             external_snapshot = await self._external_resume_snapshot_for_task(task)
             if external_snapshot:
                 external_sessions_by_task[task.id] = external_snapshot
-            if role_session_id and callable(get_role_session):
-                try:
-                    role_session = await get_role_session(role_session_id)
-                except Exception:
-                    role_session = None
-                if role_session is not None:
-                    adapter_session_state_by_role[role_session_id] = dict(
-                        getattr(role_session, "adapter_session_state", {}) or {}
-                    )
+            (
+                selected_execution_agent,
+                assigned_external_agent,
+                agent_selection_source,
+            ) = self._task_effective_execution_agent_identity(task)
+            employee_assignment = dict(metadata.get("employee_assignment", {}) or {})
+            execution_identity = {
+                "role_id": str(
+                    task.assigned_to
+                    or metadata.get("work_item_role_id", "")
+                    or ""
+                ).strip(),
+                "seat_id": str(
+                    metadata.get("delegation_seat_id", "")
+                    or metadata.get("seat_id", "")
+                    or ""
+                ).strip(),
+                "role_runtime_session_id": role_session_id,
+                "employee_id": str(employee_assignment.get("employee_id", "") or "").strip(),
+                "employee_assignment": copy.deepcopy(employee_assignment),
+                "selected_execution_agent": selected_execution_agent,
+                "assigned_external_agent": assigned_external_agent,
+                "preferred_external_agent": str(
+                    metadata.get("preferred_external_agent", "") or ""
+                ).strip(),
+                "execution_agent_locked": bool(metadata.get("execution_agent_locked", False)),
+                "selected_execution_agent_source": str(
+                    metadata.get("selected_execution_agent_source", "") or ""
+                ).strip(),
+                "agent_selection_source": agent_selection_source,
+            }
 
             work_item_id = linked_work_item_id_for_task(task)
             work_item_snapshot: dict[str, Any] = {}
@@ -5208,7 +5343,45 @@ class OPCEngine:
                         "kind": str(getattr(work_item, "kind", "") or ""),
                         "metadata": dict(getattr(work_item, "metadata", {}) or {}),
                     }
+                    execution_identity["seat_id"] = (
+                        work_item_snapshot["seat_id"]
+                        or execution_identity["seat_id"]
+                    )
+                    execution_identity["role_id"] = (
+                        work_item_snapshot["role_id"]
+                        or execution_identity["role_id"]
+                    )
+                    execution_identity["role_runtime_session_id"] = (
+                        work_item_snapshot["role_runtime_session_id"]
+                        or execution_identity["role_runtime_session_id"]
+                    )
+                    work_item_assignment = dict(
+                        work_item_snapshot["metadata"].get("employee_assignment", {})
+                        or {}
+                    )
+                    if "employee_assignment" in work_item_snapshot["metadata"]:
+                        execution_identity["employee_id"] = str(
+                            work_item_assignment.get("employee_id", "") or ""
+                        ).strip()
+                        execution_identity["employee_assignment"] = copy.deepcopy(
+                            work_item_assignment
+                        )
                     active_work_items.append(work_item_snapshot)
+
+            role_session_id = str(
+                execution_identity["role_runtime_session_id"] or ""
+            ).strip()
+            if role_session_id:
+                role_runtime_session_ids.append(role_session_id)
+            if role_session_id and callable(get_role_session):
+                try:
+                    role_session = await get_role_session(role_session_id)
+                except Exception:
+                    role_session = None
+                if role_session is not None:
+                    adapter_session_state_by_role[role_session_id] = dict(
+                        getattr(role_session, "adapter_session_state", {}) or {}
+                    )
 
             task_snapshots.append({
                 "task_id": task.id,
@@ -5217,7 +5390,9 @@ class OPCEngine:
                 "status": task.status.value if isinstance(task.status, TaskStatus) else str(task.status),
                 "title": task.title,
                 "assigned_to": task.assigned_to,
-                "assigned_external_agent": task.assigned_external_agent,
+                "assigned_external_agent": assigned_external_agent,
+                "selected_execution_agent": selected_execution_agent,
+                "execution_identity": execution_identity,
                 "work_item_id": work_item_id,
                 "projection_id": projection_id_for_task(task),
                 "turn_type": turn_type_for_task(task, fallback=""),
@@ -5798,25 +5973,6 @@ class OPCEngine:
             }
 
     @staticmethod
-    def _external_resume_token_is_provider_token(
-        token: str,
-        *,
-        task: Task,
-        agent_type: str,
-    ) -> bool:
-        value = str(token or "").strip()
-        if not value:
-            return False
-        project_id = str(task.project_id or "").strip()
-        if agent_type and project_id and value.startswith(f"{agent_type}:{project_id}:"):
-            return False
-        if agent_type and value.startswith(f"{agent_type}:"):
-            parts = value.split(":")
-            if len(parts) >= 3:
-                return False
-        return True
-
-    @staticmethod
     def _company_runtime_dependencies_satisfied(
         work_item: DelegationWorkItem,
         work_item_by_id: dict[str, DelegationWorkItem],
@@ -5894,6 +6050,232 @@ class OPCEngine:
             return Phase.READY
         return original_phase
 
+    @staticmethod
+    def _checkpoint_task_execution_identity(
+        task_snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return the immutable execution identity captured at suspension.
+
+        Checkpoints created before the explicit ``execution_identity`` field
+        already contain enough role/agent data to derive a safe identity.  The
+        derivation is intentionally local to checkpoint consumption; it is not
+        a second runtime resolver.
+        """
+
+        explicit = dict(task_snapshot.get("execution_identity", {}) or {})
+        work_item_snapshot = dict(task_snapshot.get("work_item", {}) or {})
+        work_item_metadata = dict(work_item_snapshot.get("metadata", {}) or {})
+        employee_assignment = dict(
+            explicit.get("employee_assignment", {})
+            or work_item_metadata.get("employee_assignment", {})
+            or {}
+        )
+        assigned_external_agent = str(
+            explicit.get("assigned_external_agent")
+            if "assigned_external_agent" in explicit
+            else task_snapshot.get("assigned_external_agent", "")
+            or ""
+        ).strip()
+        selected_execution_agent = normalize_recruitment_agent_choice(
+            explicit.get("selected_execution_agent")
+            or task_snapshot.get("selected_execution_agent"),
+            default=assigned_external_agent or "native",
+        ) or "native"
+        return {
+            "role_id": str(
+                explicit.get("role_id")
+                or work_item_snapshot.get("role_id")
+                or task_snapshot.get("assigned_to")
+                or ""
+            ).strip(),
+            "seat_id": str(
+                explicit.get("seat_id")
+                or work_item_snapshot.get("seat_id")
+                or ""
+            ).strip(),
+            "role_runtime_session_id": str(
+                explicit.get("role_runtime_session_id")
+                or work_item_snapshot.get("role_runtime_session_id")
+                or task_snapshot.get("role_session_id")
+                or ""
+            ).strip(),
+            "employee_id": str(
+                explicit.get("employee_id")
+                or employee_assignment.get("employee_id")
+                or ""
+            ).strip(),
+            "employee_assignment": copy.deepcopy(employee_assignment),
+            "selected_execution_agent": selected_execution_agent,
+            "assigned_external_agent": assigned_external_agent,
+            "preferred_external_agent": str(
+                explicit.get("preferred_external_agent", "") or ""
+            ).strip(),
+            "execution_agent_locked": (
+                bool(explicit.get("execution_agent_locked", False))
+                if "execution_agent_locked" in explicit
+                else None
+            ),
+            "selected_execution_agent_source": str(
+                explicit.get("agent_selection_source")
+                or explicit.get("selected_execution_agent_source", "")
+                or ""
+            ).strip(),
+            "explicit": bool(explicit),
+        }
+
+    @classmethod
+    def _restore_and_pin_company_resume_execution_identity(
+        cls,
+        task: Task,
+        work_item: DelegationWorkItem | None,
+        task_snapshot: dict[str, Any],
+        role_session: DelegationRoleSession | None,
+        *,
+        checkpoint_id: str,
+    ) -> None:
+        """Validate durable role identity and pin this resumed attempt's agent.
+
+        A resume must continue the suspended actor, not re-run recruitment or
+        adaptive backend selection.  Non-empty durable values that disagree
+        with the checkpoint fail closed.  Missing Task projection fields are
+        restored from the checkpoint after the authoritative WorkItem has also
+        been checked.
+        """
+
+        identity = cls._checkpoint_task_execution_identity(task_snapshot)
+        metadata = dict(task.metadata or {})
+        task_role_id = str(
+            task.assigned_to or metadata.get("work_item_role_id", "") or ""
+        ).strip()
+        task_seat_id = str(
+            metadata.get("delegation_seat_id", "")
+            or metadata.get("seat_id", "")
+            or ""
+        ).strip()
+        task_role_session_id = str(
+            metadata.get("delegation_role_session_id", "") or ""
+        ).strip()
+        task_assignment = dict(metadata.get("employee_assignment", {}) or {})
+        task_employee_id = str(task_assignment.get("employee_id", "") or "").strip()
+
+        work_item_metadata = dict(getattr(work_item, "metadata", {}) or {})
+        work_item_assignment = dict(
+            work_item_metadata.get("employee_assignment", {}) or {}
+        )
+        if work_item is not None:
+            current_values: dict[str, list[str]] = {
+                "role_id": [str(getattr(work_item, "role_id", "") or "").strip()],
+                "seat_id": [str(getattr(work_item, "seat_id", "") or "").strip()],
+                "role_runtime_session_id": [str(
+                    getattr(work_item, "role_runtime_session_id", "") or ""
+                ).strip()],
+                "employee_id": [str(
+                    work_item_assignment.get("employee_id", "") or ""
+                ).strip()],
+            }
+        else:
+            current_values = {
+                "role_id": [task_role_id],
+                "seat_id": [task_seat_id],
+                "role_runtime_session_id": [task_role_session_id],
+                "employee_id": [task_employee_id],
+            }
+        for field_name, values in current_values.items():
+            expected = str(identity.get(field_name, "") or "").strip()
+            if not expected:
+                continue
+            for current in values:
+                if current and current != expected:
+                    raise RuntimeError(
+                        "company runtime resume identity mismatch for "
+                        f"task {task.id}: {field_name}={current!r}, "
+                        f"checkpoint={expected!r}"
+                    )
+
+        expected_role_session_id = str(
+            identity.get("role_runtime_session_id", "") or ""
+        ).strip()
+        if expected_role_session_id and identity.get("explicit") and role_session is None:
+            raise RuntimeError(
+                "company runtime resume identity mismatch for "
+                f"task {task.id}: role runtime session {expected_role_session_id!r} is missing"
+            )
+        if role_session is not None:
+            role_session_values = {
+                "role_id": str(getattr(role_session, "role_id", "") or "").strip(),
+                "seat_id": str(getattr(role_session, "seat_id", "") or "").strip(),
+                "employee_id": str(getattr(role_session, "employee_id", "") or "").strip(),
+            }
+            for field_name, current in role_session_values.items():
+                expected = str(identity.get(field_name, "") or "").strip()
+                if expected and current and current != expected:
+                    raise RuntimeError(
+                        "company runtime resume identity mismatch for "
+                        f"task {task.id}: role session {field_name}={current!r}, "
+                        f"checkpoint={expected!r}"
+                    )
+
+        expected_agent = str(
+            identity.get("selected_execution_agent", "") or "native"
+        ).strip()
+        expected_assigned_agent = str(
+            identity.get("assigned_external_agent", "") or ""
+        ).strip()
+        if expected_agent == "native":
+            if expected_assigned_agent:
+                raise RuntimeError(
+                    f"company runtime resume checkpoint has inconsistent native agent for task {task.id}"
+                )
+        elif expected_assigned_agent and expected_assigned_agent != expected_agent:
+            raise RuntimeError(
+                f"company runtime resume checkpoint has inconsistent external agent for task {task.id}"
+            )
+        else:
+            expected_assigned_agent = expected_agent
+
+        current_agent, current_assigned_agent, _current_source = (
+            cls._task_effective_execution_agent_identity(task)
+        )
+        if (
+            current_agent != expected_agent
+            or current_assigned_agent != expected_assigned_agent
+        ):
+            raise RuntimeError(
+                "company runtime resume identity mismatch for "
+                f"task {task.id}: execution_agent={current_agent!r}, "
+                f"checkpoint={expected_agent!r}"
+            )
+
+        expected_source = str(
+            identity.get("selected_execution_agent_source", "") or ""
+        ).strip()
+
+        metadata["work_item_role_id"] = identity["role_id"] or task_role_id
+        if identity["seat_id"]:
+            metadata["delegation_seat_id"] = identity["seat_id"]
+        if identity["role_runtime_session_id"]:
+            metadata["delegation_role_session_id"] = identity[
+                "role_runtime_session_id"
+            ]
+        if identity.get("explicit") or identity["employee_assignment"]:
+            metadata["employee_assignment"] = copy.deepcopy(
+                identity["employee_assignment"]
+            )
+        metadata["selected_execution_agent"] = expected_agent
+        metadata["preferred_external_agent"] = (
+            str(identity.get("preferred_external_agent", "") or "").strip()
+            or (expected_assigned_agent if expected_agent != "native" else None)
+        )
+        metadata["_company_runtime_resume_execution_agent_pin"] = {
+            "checkpoint_id": str(checkpoint_id or "").strip(),
+            "selected_execution_agent": expected_agent,
+            "assigned_external_agent": expected_assigned_agent,
+            "selected_execution_agent_source": expected_source,
+        }
+        task.assigned_to = identity["role_id"] or task_role_id
+        task.assigned_external_agent = expected_assigned_agent or None
+        task.metadata = metadata
+
     async def _prepare_company_runtime_tasks_for_resume(
         self,
         tasks: list[Task],
@@ -5903,7 +6285,6 @@ class OPCEngine:
     ) -> list[Task]:
         assert self.store
 
-        adapter_state_by_role = dict(payload.get("adapter_session_state", {}) or {})
         task_snapshot_by_id = {
             str(item.get("task_id", "") or "").strip(): dict(item)
             for item in list(payload.get("task_snapshots", []) or [])
@@ -5916,6 +6297,7 @@ class OPCEngine:
         }
         refreshed: list[Task] = []
         get_work_item = getattr(self.store, "get_delegation_work_item", None)
+        get_role_session = getattr(self.store, "get_delegation_role_session", None)
         list_work_items = getattr(self.store, "list_delegation_work_items", None)
         update_role_session = getattr(self.store, "update_delegation_role_session", None)
         update_work_item = getattr(self.store, "update_delegation_work_item", None)
@@ -5973,6 +6355,25 @@ class OPCEngine:
             if task_is_terminal and not work_item_is_nonterminal:
                 refreshed.append(task)
                 continue
+            task_snapshot = task_snapshot_by_id.get(task.id, {})
+            if not task_snapshot:
+                raise RuntimeError(
+                    f"company runtime resume checkpoint has no task identity snapshot for {task.id}"
+                )
+            identity = self._checkpoint_task_execution_identity(task_snapshot)
+            expected_role_session_id = str(
+                identity.get("role_runtime_session_id", "") or ""
+            ).strip()
+            role_session = None
+            if expected_role_session_id and callable(get_role_session):
+                role_session = await get_role_session(expected_role_session_id)
+            self._restore_and_pin_company_resume_execution_identity(
+                task,
+                work_item,
+                task_snapshot,
+                role_session,
+                checkpoint_id=str(payload.get("checkpoint_id", "") or ""),
+            )
             task.metadata = dict(task.metadata or {})
             task.context_snapshot = dict(task.context_snapshot or {})
             runtime_resume = dict(payload.get("native_runtime_resume", {}) or {}).get(task.id)
@@ -5981,13 +6382,18 @@ class OPCEngine:
                 task.metadata["runtime_v2"] = dict(runtime_resume)
             external_sessions = dict(payload.get("external_sessions", {}) or {})
             external_session = external_sessions.get(task.id)
+            task.metadata.pop("external_resume_checkpoint_session_updated_at", None)
+            task.metadata.pop("external_resume_checkpoint_session_status", None)
             if isinstance(external_session, dict):
-                token_allowed = self._external_resume_status_allows_token(external_session.get("status"))
+                token_allowed = external_session_status_allows_resume(
+                    external_session.get("status")
+                )
                 agent_type = str(
                     external_session.get("agent_type")
                     or task.assigned_external_agent
                     or ""
                 ).strip()
+                assigned_agent_type = str(task.assigned_external_agent or "").strip()
                 token_candidates = [
                     str(external_session.get("resume_session_id") or "").strip(),
                     str(external_session.get("provider_session_id") or "").strip(),
@@ -5997,18 +6403,30 @@ class OPCEngine:
                     (
                         candidate
                         for candidate in token_candidates
-                        if self._external_resume_token_is_provider_token(
+                        if is_provider_session_token(
                             candidate,
-                            task=task,
                             agent_type=agent_type,
+                            project_id=str(task.project_id or "default"),
                         )
                     ),
                     "",
                 )
-                if token and agent_type and token_allowed:
+                if (
+                    token
+                    and agent_type
+                    and token_allowed
+                    and agent_type == assigned_agent_type
+                ):
                     task.metadata["external_resume_session_id"] = token
                     task.metadata["external_resume_agent_type"] = agent_type
                     task.metadata["external_resume_session_scope_id"] = task_session_scope_id(task)
+                    task.metadata["external_resume_checkpoint_session_updated_at"] = str(
+                        external_session.get("updated_at", "") or ""
+                    ).strip()
+                    task.metadata["external_resume_checkpoint_session_status"] = str(
+                        external_session.get("status", "") or ""
+                    ).strip()
+                    task.metadata.pop("external_resume_fallback", None)
                 elif task.assigned_external_agent:
                     task.metadata.pop("external_resume_session_id", None)
                     task.metadata.pop("external_resume_agent_type", None)
@@ -6017,7 +6435,6 @@ class OPCEngine:
             task.execution_lock = False
             task.execution_locked_at = None
             task.result = None
-            task_snapshot = task_snapshot_by_id.get(task.id, {})
             work_item_snapshot = work_item_snapshot_by_id.get(work_item_id, {})
             task_work_item_snapshot = task_snapshot.get("work_item", {})
             phase_value = str(work_item_snapshot.get("phase", "") or "").strip()
@@ -6121,13 +6538,11 @@ class OPCEngine:
 
             role_session_id = str(task.metadata.get("delegation_role_session_id", "") or "").strip()
             if role_session_id and callable(update_role_session):
-                adapter_state = adapter_state_by_role.get(role_session_id)
                 try:
                     await update_role_session(
                         role_session_id,
                         focused_work_item_id="",
                         status="idle",
-                        adapter_session_state=dict(adapter_state) if isinstance(adapter_state, dict) else None,
                         metadata_updates={
                             "last_resume_checkpoint_type": str(payload.get("checkpoint_type", "") or ""),
                             "last_resume_requested_at": datetime.now().isoformat(),
@@ -6260,6 +6675,108 @@ class OPCEngine:
             return None
         return await fallback(agent_type, project_id, task_id=task.id)
 
+    async def _load_best_external_resume_session_for_task(
+        self,
+        task: Task,
+    ) -> Any | None:
+        """Prefer a real provider thread over monitoring placeholder rows.
+
+        A live run initially owns a synthetic ``agent:project:task`` row.  The
+        provider may publish its real thread id milliseconds later with the
+        same (or an older) timestamp.  Recency alone is therefore not a valid
+        resume-token selector.
+        """
+
+        if not self.store or not task.id:
+            return None
+        agent_type = str(task.assigned_external_agent or "").strip()
+        if not agent_type:
+            return None
+        list_sessions = getattr(self.store, "list_external_sessions", None)
+        if not callable(list_sessions):
+            return None
+        try:
+            sessions = await list_sessions(
+                project_id=task.project_id or self.project_id or "default",
+                task_id=task.id,
+                limit=100,
+            )
+        except TypeError:
+            return None
+        except Exception:
+            logger.opt(exception=True).debug(
+                "failed to list external resume-session candidates"
+            )
+            return None
+        selected, _token = select_best_external_resume_session(
+            sessions,
+            agent_type=agent_type,
+            project_id=str(task.project_id or self.project_id or "default"),
+        )
+        return selected
+
+    async def _checkpoint_external_resume_token_was_terminalized(
+        self,
+        task: Task,
+        *,
+        agent_type: str,
+        token: str,
+        checkpoint_updated_at: str,
+        checkpoint_status: str,
+    ) -> bool:
+        """Let a newer durable terminal row veto a checkpoint's working token."""
+
+        if not self.store or not task.id or not checkpoint_updated_at:
+            return False
+        list_sessions = getattr(self.store, "list_external_sessions", None)
+        if not callable(list_sessions):
+            return False
+        try:
+            sessions = await list_sessions(
+                project_id=task.project_id or self.project_id or "default",
+                task_id=task.id,
+                limit=100,
+            )
+        except Exception:
+            logger.opt(exception=True).debug(
+                "failed to verify checkpoint external resume token status"
+            )
+            return False
+        matching = [
+            session
+            for session in sessions
+            if str(getattr(session, "agent_type", "") or "").strip() == agent_type
+            and external_session_matches_provider_token(session, token)
+        ]
+        if not matching:
+            return False
+
+        def _timestamp(value: Any) -> float:
+            candidate = value
+            if isinstance(candidate, str):
+                try:
+                    candidate = datetime.fromisoformat(candidate)
+                except ValueError:
+                    return 0.0
+            try:
+                return float(candidate.timestamp())
+            except Exception:
+                return 0.0
+
+        latest = max(
+            matching,
+            key=lambda session: _timestamp(getattr(session, "updated_at", None)),
+        )
+        latest_status = str(getattr(latest, "status", "") or "").strip().lower()
+        if external_session_status_allows_resume(latest_status):
+            return False
+        latest_timestamp = _timestamp(getattr(latest, "updated_at", None))
+        checkpoint_timestamp = _timestamp(checkpoint_updated_at)
+        return latest_timestamp > checkpoint_timestamp or (
+            latest_timestamp >= checkpoint_timestamp
+            and latest_status != str(checkpoint_status or "").strip().lower()
+        )
+
     @staticmethod
     def _clone_external_adapter(adapter: Any) -> Any:
         config = getattr(adapter, "config", None)
@@ -6340,25 +6857,58 @@ class OPCEngine:
                 or metadata_agent_type != run_adapter.agent_type
             )
         )
-        synthetic_prefix = f"{run_adapter.agent_type}:{task.project_id}:"
+        project_id = str(task.project_id or self.project_id or "default").strip() or "default"
         session_token = (
             metadata_session_token
             if metadata_session_token
             and metadata_agent_type == run_adapter.agent_type
-            and not metadata_session_token.startswith(synthetic_prefix)
+            and is_provider_session_token(
+                metadata_session_token,
+                agent_type=run_adapter.agent_type,
+                project_id=project_id,
+            )
             else ""
         )
-        latest_session = await self._load_latest_external_session_for_task(task)
+        if session_token and await self._checkpoint_external_resume_token_was_terminalized(
+            task,
+            agent_type=run_adapter.agent_type,
+            token=session_token,
+            checkpoint_updated_at=str(
+                task.metadata.get("external_resume_checkpoint_session_updated_at", "")
+                or ""
+            ).strip(),
+            checkpoint_status=str(
+                task.metadata.get("external_resume_checkpoint_session_status", "")
+                or ""
+            ).strip(),
+        ):
+            task.metadata = dict(task.metadata or {})
+            task.metadata.pop("external_resume_session_id", None)
+            task.metadata.pop("external_resume_agent_type", None)
+            task.metadata.pop("external_resume_session_scope_id", None)
+            task.metadata["external_resume_fallback"] = "context_replay_provider_terminal"
+            cloned_config = (
+                run_adapter.config.model_copy(deep=True)
+                if hasattr(run_adapter.config, "model_copy")
+                else run_adapter.config
+            )
+            if hasattr(cloned_config, "session_mode"):
+                cloned_config.session_mode = "new"
+            if hasattr(cloned_config, "session_id"):
+                cloned_config.session_id = ""
+            return run_adapter.__class__(config=cloned_config), resume_metadata
+        latest_session = (
+            await self._load_best_external_resume_session_for_task(task)
+            or await self._load_latest_external_session_for_task(task)
+        )
         if latest_session and str(getattr(latest_session, "agent_type", "") or "").strip() != run_adapter.agent_type:
             latest_session = None
         if not session_token:
-            metadata = dict(getattr(latest_session, "metadata", {}) or {}) if latest_session else {}
-            session_token = str(metadata.get("resume_session_id") or metadata.get("provider_session_id") or "").strip()
-        if not session_token:
-            persisted_session_id = str(getattr(latest_session, "session_id", "") or "").strip() if latest_session else ""
-            synthetic_prefix = f"{run_adapter.agent_type}:{task.project_id}:"
-            if persisted_session_id and not persisted_session_id.startswith(synthetic_prefix):
-                session_token = persisted_session_id
+            session_token = provider_token_from_external_session(
+                latest_session,
+                agent_type=run_adapter.agent_type,
+                project_id=project_id,
+            )
         if not session_token and not latest_session and metadata_token_is_unusable:
             return run_adapter, resume_metadata
         if not session_token:
@@ -8378,6 +8928,18 @@ class OPCEngine:
                     or (
                         bool(task.metadata.get("execution_agent_locked"))
                         and str(task.metadata.get("selected_execution_agent", "") or "").strip() == agent_name
+                    )
+                    or (
+                        str(
+                            dict(task.metadata.get("agent_selection", {}) or {}).get(
+                                "selection_source",
+                                "",
+                            )
+                            or ""
+                        ).strip()
+                        == "company_runtime_resume_checkpoint"
+                        and str(task.assigned_external_agent or "").strip()
+                        == agent_name
                     )
                 )
                 metadata = {
@@ -10818,6 +11380,19 @@ class OPCEngine:
                         tasks,
                         checkpoint_session_id=parent_session_id,
                     )
+                notify_kanban_changed = getattr(
+                    self.company_executor,
+                    "_notify_kanban_changed",
+                    None,
+                )
+                if callable(notify_kanban_changed):
+                    # The registry attempt above belongs to this successful
+                    # checkpoint handoff, and resume preparation has now
+                    # cleared its durable holds.  Publish through the existing
+                    # canonical snapshot path so UI control state becomes
+                    # running/stoppable without introducing a second
+                    # liveness signal in the WS layer.
+                    await notify_kanban_changed()
         except asyncio.CancelledError as exc:
             if driver_ownership is not None:
                 driver_ownership.release()

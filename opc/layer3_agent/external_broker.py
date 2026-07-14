@@ -32,6 +32,13 @@ from opc.layer2_organization.work_item_runtime import is_work_item_runtime_metad
 from opc.layer2_organization.work_item_identity import projection_id_for_task, turn_type_for_task
 from opc.layer2_organization.work_item_links import linked_work_item_id_for_task, set_linked_work_item_id
 from opc.layer3_agent.adapters.base import ExternalAgentAdapter
+from opc.layer3_agent.external_session_identity import (
+    external_session_allows_resume,
+    external_session_matches_provider_token,
+    is_provider_session_token,
+    provider_token_from_external_session,
+    select_best_external_resume_session,
+)
 from opc.layer3_agent.preflight import (
     assert_external_agent_write_contract,
     ExternalAgentPreflightError,
@@ -49,15 +56,6 @@ from opc.layer4_tools.collaboration_rpc import (
     OPC_COLLAB_RPC_TRANSPORT,
     start_collaboration_rpc_server,
 )
-
-
-def _external_session_allows_resume(session: ExternalSession | None) -> bool:
-    if session is None:
-        return False
-    status = str(getattr(session, "status", "") or "").strip().lower()
-    if status in {"failed", "cancelled", "denied", "rejected", "hard_timeout", "idle_timeout", "startup_timeout"}:
-        return False
-    return True
 
 
 def _collaboration_role_cfg(org_engine: Any | None, role_id: str) -> Any | None:
@@ -103,6 +101,78 @@ class ExternalAgentBroker:
     @staticmethod
     def _normalize_external_agent_choice(value: Any) -> str:
         return re.sub(r"[\s\-]+", "_", str(value or "").strip()).strip("_").lower()
+
+    async def _best_resume_external_session(
+        self,
+        *,
+        adapter: ExternalAgentAdapter,
+        task: Task,
+        role_session_id: str,
+    ) -> ExternalSession | None:
+        list_sessions = getattr(self.store, "list_external_sessions", None)
+        if not callable(list_sessions):
+            return None
+        project_id = str(task.project_id or "default").strip() or "default"
+        kwargs: dict[str, Any] = {
+            "project_id": project_id,
+            "limit": 100,
+        }
+        if role_session_id:
+            kwargs["opc_session_id"] = role_session_id
+        else:
+            kwargs["task_id"] = task.id
+        try:
+            sessions = await list_sessions(**kwargs)
+        except TypeError:
+            return None
+        except Exception:
+            logger.opt(exception=True).debug(
+                "External resume restore: candidate listing failed"
+            )
+            return None
+        selected, _token = select_best_external_resume_session(
+            sessions,
+            agent_type=adapter.agent_type,
+            project_id=project_id,
+        )
+        return selected
+
+    async def _provider_stream_token_allows_resume(
+        self,
+        *,
+        adapter: ExternalAgentAdapter,
+        task: Task,
+        role_session_id: str,
+        token: str,
+    ) -> bool:
+        """Cross-check an early stream token against its latest run status."""
+
+        list_sessions = getattr(self.store, "list_external_sessions", None)
+        if not callable(list_sessions):
+            return False
+        project_id = str(task.project_id or "default").strip() or "default"
+        kwargs: dict[str, Any] = {"project_id": project_id, "limit": 100}
+        if role_session_id:
+            kwargs["opc_session_id"] = role_session_id
+        else:
+            kwargs["task_id"] = task.id
+        try:
+            sessions = await list_sessions(**kwargs)
+        except Exception:
+            logger.opt(exception=True).debug(
+                "External resume restore: provider-stream status lookup failed"
+            )
+            return False
+        for session in sessions:
+            if str(getattr(session, "agent_type", "") or "").strip() != adapter.agent_type:
+                continue
+            if external_session_matches_provider_token(session, token):
+                return (
+                    external_session_allows_resume(session)
+                    and str(getattr(session, "status", "") or "").strip().lower()
+                    in {"done", "suspended"}
+                )
+        return False
 
     @classmethod
     def _task_explicitly_selected_external_agent(cls, task: Task, agent_type: str) -> bool:
@@ -402,6 +472,8 @@ class ExternalAgentBroker:
         config = getattr(adapter, "config", None)
         if config is None:
             return
+        if str(getattr(config, "session_mode", "") or "").strip().lower() == "new":
+            return
         # Respect already-configured resume state.
         if str(getattr(config, "session_mode", "") or "").strip().lower() == "resume" and getattr(config, "session_id", ""):
             return
@@ -440,21 +512,64 @@ class ExternalAgentBroker:
                     or entry.get("provider_session_id")
                     or ""
                 ).strip()
+                if not is_provider_session_token(
+                    session_token,
+                    agent_type=adapter.agent_type,
+                    project_id=project_id,
+                ):
+                    session_token = ""
+                if (
+                    session_token
+                    and str(entry.get("source", "") or "").strip()
+                    == "provider_stream"
+                    and not await self._provider_stream_token_allows_resume(
+                        adapter=adapter,
+                        task=task,
+                        role_session_id=role_session_id,
+                        token=session_token,
+                    )
+                ):
+                    session_token = ""
+                    clear_role_state = getattr(
+                        store,
+                        "update_role_session_adapter_state",
+                        None,
+                    )
+                    if callable(clear_role_state):
+                        try:
+                            await clear_role_state(
+                                role_session_id,
+                                adapter.agent_type,
+                                None,
+                            )
+                        except Exception:
+                            logger.opt(exception=True).debug(
+                                "External resume restore: stale provider-stream token clear failed"
+                            )
+                    # Do not immediately rediscover the same unfinalized or
+                    # failed stream row through the compatibility fallback.
+                    return
 
         prior = None
         if not session_token:
+            prior = await self._best_resume_external_session(
+                adapter=adapter,
+                task=task,
+                role_session_id=role_session_id,
+            )
             if role_session_id:
-                try:
-                    prior = await store.get_external_session(
-                        adapter.agent_type,
-                        project_id,
-                        opc_session_id=role_session_id,
-                    )
-                except Exception:
-                    logger.opt(exception=True).debug(
-                        f"External resume restore: get_external_session by role failed for {adapter.agent_type}/{role_session_id}",
-                    )
-                    prior = None
+                if prior is None:
+                    try:
+                        prior = await store.get_external_session(
+                            adapter.agent_type,
+                            project_id,
+                            opc_session_id=role_session_id,
+                        )
+                    except Exception:
+                        logger.opt(exception=True).debug(
+                            f"External resume restore: get_external_session by role failed for {adapter.agent_type}/{role_session_id}",
+                        )
+                        prior = None
             if prior is None:
                 try:
                     prior = await store.get_external_session(
@@ -469,7 +584,7 @@ class ExternalAgentBroker:
                     return
             if prior is None:
                 return
-            if not _external_session_allows_resume(prior):
+            if not external_session_allows_resume(prior):
                 if on_progress:
                     await on_progress(
                         f"[External resume] {adapter.agent_type} skipped prior "
@@ -477,12 +592,11 @@ class ExternalAgentBroker:
                     )
                 return
 
-            session_token = str(
-                (prior.metadata or {}).get("resume_session_id")
-                or (prior.metadata or {}).get("provider_session_id")
-                or prior.session_id
-                or ""
-            ).strip()
+            session_token = provider_token_from_external_session(
+                prior,
+                agent_type=adapter.agent_type,
+                project_id=project_id,
+            )
         can_resume_without_session_id = bool(
             adapter.can_resume_without_session_id()
             if hasattr(adapter, "can_resume_without_session_id")
@@ -506,6 +620,86 @@ class ExternalAgentBroker:
             await on_progress(
                 f"[External resume] {adapter.agent_type} restored prior session → {label}"
             )
+
+    async def _persist_discovered_provider_session(
+        self,
+        *,
+        adapter: ExternalAgentAdapter,
+        task: Task,
+        workspace_path: str,
+        runtime_session_id: str,
+        metadata: dict[str, Any],
+        provider_session_id: str,
+        status: str,
+        extra: dict[str, Any],
+    ) -> bool:
+        """Persist a provider thread as soon as it appears on the stream.
+
+        Waiting for process exit loses the token when Stop cancels the broker.
+        The external-session row is written first, then the canonical per-role
+        adapter state, so a concurrent suspend checkpoint can capture either
+        durable source.
+        """
+
+        project_id = str(task.project_id or "default").strip() or "default"
+        token = str(provider_session_id or "").strip()
+        if not is_provider_session_token(
+            token,
+            agent_type=adapter.agent_type,
+            project_id=project_id,
+        ):
+            return False
+        metadata["resume_session_id"] = token
+        metadata["provider_session_id"] = token
+        task.metadata = dict(task.metadata or {})
+        task.metadata["external_resume_session_id"] = token
+        task.metadata["external_resume_agent_type"] = adapter.agent_type
+        task.metadata["external_resume_session_scope_id"] = task_session_scope_id(task)
+        discovered_at = datetime.now().isoformat()
+        await self._save_runtime_session(
+            adapter=adapter,
+            task=task,
+            workspace_path=workspace_path,
+            session_id=runtime_session_id,
+            status=status,
+            metadata=metadata,
+            extra={
+                **dict(extra or {}),
+                "resume_session_id": token,
+                "provider_session_id": token,
+                "provider_session_discovered_at": discovered_at,
+            },
+        )
+        role_session_id = str(
+            task.metadata.get("delegation_role_session_id", "") or ""
+        ).strip()
+        update_role_state = getattr(
+            self.store,
+            "update_role_session_adapter_state",
+            None,
+        )
+        if role_session_id and callable(update_role_state):
+            try:
+                await update_role_state(
+                    role_session_id,
+                    adapter.agent_type,
+                    {
+                        "resume_session_id": token,
+                        "provider_session_id": token,
+                        "agent_type": adapter.agent_type,
+                        "updated_at": discovered_at,
+                        "last_task_id": str(task.id or ""),
+                        "last_project_id": project_id,
+                        "workspace_path": workspace_path,
+                        "source": "provider_stream",
+                        "status": "working",
+                    },
+                )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "Provider stream token role-state write failed"
+                )
+        return True
 
     async def _run_interactive(
         self,
@@ -741,7 +935,9 @@ class ExternalAgentBroker:
             "timeout_reason": "",
             "fatal_reason": "",
             "process_cleanup": {},
+            "provider_session_id": "",
         }
+        provider_session_lock = asyncio.Lock()
         stream_line_counts: dict[str, int] = {}
         trace_path = self._external_trace_path(adapter, task, started_at)
 
@@ -782,6 +978,37 @@ class ExternalAgentBroker:
                     stream_name=stream_name,
                     text=text,
                 )
+                if text.strip():
+                    try:
+                        discovered_provider_session_id = str(
+                            adapter.extract_resume_session_id(text) or ""
+                        ).strip()
+                    except Exception:
+                        discovered_provider_session_id = ""
+                    if discovered_provider_session_id:
+                        async with provider_session_lock:
+                            if not state["provider_session_id"]:
+                                persisted = await self._persist_discovered_provider_session(
+                                    adapter=adapter,
+                                    task=task,
+                                    workspace_path=workspace_path,
+                                    runtime_session_id=session_id,
+                                    metadata=metadata,
+                                    provider_session_id=discovered_provider_session_id,
+                                    status="working",
+                                    extra={
+                                        "pid": proc.pid,
+                                        "started_at": started_at.isoformat(),
+                                        "last_activity_at": datetime.now().isoformat(),
+                                        "activity_count": state["activity_count"] + 1,
+                                        "last_output": text.strip(),
+                                        "stream": stream_name,
+                                    },
+                                )
+                                if persisted:
+                                    state["provider_session_id"] = (
+                                        discovered_provider_session_id
+                                    )
                 try:
                     fatal_reason = adapter.detect_runtime_failure(text, stream_name, metadata)
                 except TypeError:
@@ -1024,6 +1251,7 @@ class ExternalAgentBroker:
         heartbeat_task = asyncio.create_task(_heartbeat())
         idle_task = asyncio.create_task(_watch_idle())
         inbox_task = asyncio.create_task(_poll_inbox())
+        cancellation_status_persisted = False
 
         try:
             try:
@@ -1113,11 +1341,9 @@ class ExternalAgentBroker:
                     "return_code": proc.returncode,
                 },
             )
+            cancellation_status_persisted = True
             raise
         finally:
-            if proc.returncode is None:
-                state["process_cleanup"] = await self._terminate_process(proc)
-
             async def _cancel_and_await(task_obj: asyncio.Task[Any]) -> None:
                 task_obj.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -1137,16 +1363,62 @@ class ExternalAgentBroker:
                         return
                     raise
 
-            for task_obj in (heartbeat_task, idle_task, inbox_task):
-                await _cancel_and_await(task_obj)
-            for task_obj in (stdout_task, stderr_task):
-                await _drain_reader_task(task_obj)
+            async def _finish_process_cleanup() -> None:
+                if proc.returncode is None:
+                    state["process_cleanup"] = await self._terminate_process(proc)
+                for task_obj in (heartbeat_task, idle_task, inbox_task):
+                    await _cancel_and_await(task_obj)
+                for task_obj in (stdout_task, stderr_task):
+                    await _drain_reader_task(task_obj)
+                try:
+                    await adapter.cleanup_process(proc)
+                finally:
+                    if collab_rpc_server is not None:
+                        await collab_rpc_server.close()
+                    adapter._process = None  # noqa: SLF001
+
+            cleanup_task = asyncio.create_task(_finish_process_cleanup())
             try:
-                await adapter.cleanup_process(proc)
-            finally:
-                if collab_rpc_server is not None:
-                    await collab_rpc_server.close()
-                adapter._process = None  # noqa: SLF001
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                # Cancellation can arrive after proc.wait() completed but
+                # while stdout/adapter cleanup is still draining.  Finish the
+                # cleanup in its own task and make the provider row terminal
+                # before propagating cancellation; otherwise a stale
+                # checkpoint can retain a false `working` capability.
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await cleanup_task
+                if not cancellation_status_persisted:
+                    cleanup_terminal_status = (
+                        "done" if proc.returncode == 0 else "failed"
+                    )
+                    terminal_save = asyncio.create_task(self._save_runtime_session(
+                        adapter=adapter,
+                        task=task,
+                        workspace_path=workspace_path,
+                        session_id=session_id,
+                        status=cleanup_terminal_status,
+                        metadata=metadata,
+                        extra={
+                            "pid": proc.pid,
+                            "started_at": started_at.isoformat(),
+                            "last_activity_at": state["last_activity_at"].isoformat(),
+                            "activity_count": state["activity_count"],
+                            "last_output": state["last_output"],
+                            "return_code": proc.returncode,
+                            "failure_reason": (
+                                ""
+                                if cleanup_terminal_status == "done"
+                                else f"{adapter.agent_type} exited with code {proc.returncode}"
+                            ),
+                        },
+                    ))
+                    try:
+                        await asyncio.shield(terminal_save)
+                    except asyncio.CancelledError:
+                        with contextlib.suppress(Exception, asyncio.CancelledError):
+                            await terminal_save
+                raise
         output = "".join(stdout_chunks)
         errors = "".join(stderr_chunks)
         normalized_output = adapter.normalize_result_output(output)
@@ -1197,6 +1469,43 @@ class ExternalAgentBroker:
             raw_output=output,
             base_artifacts=artifacts,
         )
+        terminal_status = (
+            "done"
+            if not state["timed_out"]
+            and not state["fatal_reason"]
+            and return_code == 0
+            else "failed"
+        )
+        terminal_save = asyncio.create_task(self._save_runtime_session(
+            adapter=adapter,
+            task=task,
+            workspace_path=workspace_path,
+            session_id=session_id,
+            status=terminal_status,
+            metadata=metadata,
+            extra={
+                **artifacts,
+                "return_code": return_code,
+                "failure_reason": (
+                    ""
+                    if terminal_status == "done"
+                    else str(
+                        state["timeout_reason"]
+                        or state["fatal_reason"]
+                        or f"{adapter.agent_type} exited with code {return_code}"
+                    )
+                ),
+            },
+        ))
+        try:
+            await asyncio.shield(terminal_save)
+        except asyncio.CancelledError:
+            # Once the subprocess has exited, its terminal status must win
+            # over the early provider-stream `working` capability even if the
+            # parent coroutine is cancelled in this narrow handoff window.
+            with contextlib.suppress(Exception):
+                await terminal_save
+            raise
         if state["timed_out"]:
             return TaskResult(
                 status=TaskStatus.FAILED,
@@ -2107,6 +2416,11 @@ class ExternalAgentBroker:
                     or metadata.get("resume_session_id")
                     or ""
                 ).strip(),
+                "provider_session_id": str(
+                    extra.get("provider_session_id")
+                    or metadata.get("provider_session_id")
+                    or ""
+                ).strip(),
                 **extra,
             },
             updated_at=datetime.now(),
@@ -2232,3 +2546,33 @@ class ExternalAgentBroker:
                         f"PR6 role adapter-state write failed "
                         f"sid={role_session_id} agent={adapter.agent_type}",
                     )
+        elif (
+            role_session_id
+            and result.status != TaskStatus.DONE
+            and hasattr(self.store, "get_role_session_adapter_state")
+            and hasattr(self.store, "update_role_session_adapter_state")
+        ):
+            # A stream token is durable early so Stop can retain it.  A normal
+            # terminal failure, however, must not leave that attempt's token
+            # pinned for a later unrelated turn.
+            try:
+                current = await self.store.get_role_session_adapter_state(
+                    role_session_id,
+                    adapter.agent_type,
+                )
+                if (
+                    isinstance(current, dict)
+                    and str(current.get("last_task_id", "") or "").strip()
+                    == str(task.id or "").strip()
+                    and str(current.get("source", "") or "").strip()
+                    == "provider_stream"
+                ):
+                    await self.store.update_role_session_adapter_state(
+                        role_session_id,
+                        adapter.agent_type,
+                        None,
+                    )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "Failed to clear provider-stream role state after terminal failure"
+                )

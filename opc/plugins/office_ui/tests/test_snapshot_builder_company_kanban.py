@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from opc.core.models import DelegationRun, DelegationWorkItem, Phase
+from opc.core.models import DelegationRun, DelegationWorkItem, ExecutionCheckpoint, Phase
 from opc.database.store import OPCStore
 from opc.plugins.office_ui.snapshot_builder import (
     _build_company_runtime_control_by_task,
@@ -144,6 +144,132 @@ class CompanyKanbanProjectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(control["parent-task"]["runtime_control_state"], "idle")
         self.assertFalse(control["parent-task"]["can_stop"])
         engine._task_runtime_is_live.assert_awaited_once_with(parent_task)
+
+    async def test_registry_live_resume_checkpoint_projects_running_and_stoppable(self) -> None:
+        created_at = datetime.now(timezone.utc)
+        parent_task = SimpleNamespace(
+            id="parent-task",
+            session_id="session-root",
+            parent_session_id="",
+            title="Root runtime",
+            status="running",
+            created_at=created_at,
+            metadata={
+                "exec_mode": "company",
+                "company_profile": "corporate",
+            },
+        )
+        terminal_driver_task = SimpleNamespace(
+            id="terminal-driver-task",
+            session_id="driver-session",
+            parent_session_id="session-root",
+            title="Terminal driver envelope",
+            status="done",
+            created_at=created_at,
+            metadata={
+                "mode": "company",
+                "work_item_runtime": True,
+                "work_item_projection_id": "driver",
+            },
+        )
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="resume-checkpoint",
+            project_id="proj1",
+            session_id="session-root",
+            checkpoint_type="company_runtime_suspended",
+            status="resuming",
+            task_id="terminal-driver-task",
+            payload={"parent_session_id": "session-root"},
+        )
+        store = MagicMock()
+        store.get_execution_checkpoints = AsyncMock(return_value=[checkpoint])
+        engine = SimpleNamespace(
+            store=store,
+            _task_runtime_is_live=AsyncMock(
+                side_effect=lambda task: task.id == "terminal-driver-task"
+            ),
+        )
+
+        control = await _build_company_runtime_control_by_task(
+            engine,
+            [parent_task, terminal_driver_task],
+            "proj1",
+        )
+
+        self.assertEqual(
+            control["parent-task"]["runtime_control_state"],
+            "running",
+        )
+        self.assertTrue(control["parent-task"]["can_stop"])
+        self.assertFalse(control["parent-task"]["can_resume"])
+
+    async def test_stop_hold_and_pending_checkpoint_override_live_resume_projection(self) -> None:
+        created_at = datetime.now(timezone.utc)
+        parent_task = SimpleNamespace(
+            id="parent-task",
+            session_id="session-root",
+            parent_session_id="",
+            title="Root runtime",
+            status="running",
+            created_at=created_at,
+            metadata={
+                "exec_mode": "company",
+                "company_profile": "corporate",
+            },
+        )
+        child_task = SimpleNamespace(
+            id="child-task",
+            session_id="child-session",
+            parent_session_id="session-root",
+            title="Live child",
+            status="done",
+            created_at=created_at,
+            metadata={
+                "mode": "company",
+                "work_item_runtime": True,
+                "work_item_projection_id": "child",
+                "dispatch_hold": "company_runtime_suspended",
+            },
+        )
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="resume-checkpoint",
+            project_id="proj1",
+            session_id="session-root",
+            checkpoint_type="company_runtime_suspended",
+            status="resuming",
+            task_id="child-task",
+            payload={"parent_session_id": "session-root"},
+        )
+        store = MagicMock()
+        store.get_execution_checkpoints = AsyncMock(return_value=[checkpoint])
+        engine = SimpleNamespace(
+            store=store,
+            _task_runtime_is_live=AsyncMock(return_value=True),
+        )
+
+        suspending = await _build_company_runtime_control_by_task(
+            engine,
+            [parent_task, child_task],
+            "proj1",
+        )
+        self.assertEqual(
+            suspending["parent-task"]["runtime_control_state"],
+            "suspending",
+        )
+        self.assertFalse(suspending["parent-task"]["can_stop"])
+
+        checkpoint.status = "pending"
+        suspended = await _build_company_runtime_control_by_task(
+            engine,
+            [parent_task, child_task],
+            "proj1",
+        )
+        self.assertEqual(
+            suspended["parent-task"]["runtime_control_state"],
+            "suspended",
+        )
+        self.assertFalse(suspended["parent-task"]["can_stop"])
+        self.assertTrue(suspended["parent-task"]["can_resume"])
 
     async def test_runtime_control_treats_dispatch_hold_as_suspending_without_checkpoint(self) -> None:
         created_at = datetime.now(timezone.utc)

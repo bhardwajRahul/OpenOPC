@@ -19,6 +19,7 @@ from opc.core.models import (
     AgentStatus,
     ApprovalAction,
     ApprovalDecision,
+    DelegationRoleSession,
     DelegationWorkItem,
     ExecutionMode,
     Phase,
@@ -32,6 +33,8 @@ from opc.engine import OPCEngine
 from opc.layer1_perception.context_assembler import ContextAssembler, ExternalContextLayers
 from opc.layer2_organization import comms as file_comms
 from opc.layer2_organization.prompt_contract import make_prompt_contract
+from opc.layer2_organization.company_mode import serialize_company_work_item_runtime_plan
+from opc.layer2_organization.org_work_item_planner import CompanyWorkItemRuntimePlan
 from opc.layer2_organization.work_item_links import set_linked_work_item_id
 from opc.layer3_agent.adapters.claude_code import ClaudeCodeAdapter
 from opc.layer3_agent.adapters.codex_adapter import CodexAdapter
@@ -546,6 +549,357 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             assert session is not None
             self.assertEqual(session.session_id, "ses_1")
             self.assertEqual(session.metadata.get("resume_session_id"), "ses_1")
+            await store.close()
+
+    async def test_live_provider_thread_is_durable_before_stop_checkpoint_and_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            role_session_id = "role-runtime::run-live::executor"
+            parent_session_id = "company-live-session"
+            await store.save_delegation_role_session(DelegationRoleSession(
+                role_session_id=role_session_id,
+                run_id="run-live",
+                role_id="executor",
+                seat_id="seat-live",
+            ))
+            await store.save_task(Task(
+                id="ui-live",
+                title="Company chat",
+                session_id=parent_session_id,
+                project_id="proj1",
+                status=TaskStatus.IDLE,
+                metadata={"exec_mode": "company", "company_profile": "corporate"},
+            ))
+            work_item = DelegationWorkItem(
+                work_item_id="work-live",
+                run_id="run-live",
+                role_id="executor",
+                seat_id="seat-live",
+                role_runtime_session_id=role_session_id,
+                title="Live work",
+                projection_id="live",
+                phase=Phase.RUNNING,
+                claimed_by_role_runtime_session_id=role_session_id,
+                claimed_by_seat_id="seat-live",
+                metadata={"work_item_projection_id": "live"},
+            )
+            await store.save_delegation_work_item(work_item)
+            plan = CompanyWorkItemRuntimePlan(
+                profile="corporate",
+                metadata={
+                    "execution_model": "multi_team_org",
+                    "runtime_model": "multi_team_org",
+                },
+            )
+            task = Task(
+                id="live-provider-task",
+                title="Live provider task",
+                session_id="live-child-session",
+                parent_session_id=parent_session_id,
+                project_id="proj1",
+                assigned_to="executor",
+                assigned_external_agent="script_agent",
+                status=TaskStatus.RUNNING,
+                metadata={
+                    "work_item_runtime": True,
+                    "work_item_projection_id": "live",
+                    "delegation_run_id": "run-live",
+                    "delegation_role_session_id": role_session_id,
+                    "delegation_seat_id": "seat-live",
+                    "selected_execution_agent": "script_agent",
+                    "selected_execution_agent_source": "fallback_rules",
+                    "company_profile": "corporate",
+                    "execution_model": "multi_team_org",
+                    "runtime_model": "multi_team_org",
+                    "company_work_item_plan": serialize_company_work_item_runtime_plan(plan),
+                },
+            )
+            set_linked_work_item_id(task, work_item.work_item_id)
+            await store.save_task(task)
+            await store.link_work_item_runtime_task(work_item.work_item_id, task.id)
+
+            broker = ExternalAgentBroker(store, _ApprovalStub())
+            adapter = _ScriptAdapter(
+                "import json,sys,time\n"
+                "print(json.dumps({'sessionID': 'provider-live-thread'}))\n"
+                "sys.stdout.flush()\n"
+                "time.sleep(30)\n"
+            )
+            run_task = asyncio.create_task(broker.run(adapter, task, tmpdir))
+            role_state = None
+            for _ in range(200):
+                role_state = await store.get_role_session_adapter_state(
+                    role_session_id,
+                    "script_agent",
+                )
+                if role_state and role_state.get("resume_session_id"):
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIsNotNone(role_state)
+            assert role_state is not None
+            self.assertEqual(
+                role_state["resume_session_id"],
+                "provider-live-thread",
+            )
+            self.assertFalse(run_task.done())
+
+            engine = OPCEngine()
+            engine.project_id = "proj1"
+            engine.store = store
+            await engine.suspend_company_runtime(
+                origin_task_id="ui-live",
+                session_id=parent_session_id,
+                reason="user_stop",
+            )
+            checkpoint = (
+                await store.get_pending_checkpoints(
+                    project_id="proj1",
+                    session_id=parent_session_id,
+                    checkpoint_types=["company_runtime_suspended"],
+                )
+            )[0]
+            captured = checkpoint.payload["external_sessions"][task.id]
+            self.assertEqual(
+                captured["resume_session_id"],
+                "provider-live-thread",
+            )
+            self.assertEqual(
+                captured["provider_session_id"],
+                "provider-live-thread",
+            )
+
+            run_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await run_task
+
+            resumed_task = await store.get_task(task.id)
+            assert resumed_task is not None
+            resume_adapter = _ScriptAdapter("print('unused')")
+            resume_adapter.config.resume_session_flag = "--resume"
+            await broker._restore_session_resume_from_store(
+                resume_adapter,
+                resumed_task,
+            )
+            self.assertEqual(resume_adapter.config.session_mode, "resume")
+            self.assertEqual(
+                resume_adapter.config.session_id,
+                "provider-live-thread",
+            )
+            await store.close()
+
+    async def test_codex_thread_started_stream_restores_real_resume_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            role_session_id = "role-runtime::codex-live::executor"
+            await store.save_delegation_role_session(DelegationRoleSession(
+                role_session_id=role_session_id,
+                run_id="codex-live",
+                project_id="proj1",
+                role_id="executor",
+                seat_id="seat-codex-live",
+            ))
+            task = Task(
+                id="codex-live-task",
+                title="Codex live task",
+                description="Keep the same Codex thread.",
+                project_id="proj1",
+                session_id="codex-live-child",
+                parent_session_id="codex-live-parent",
+                assigned_to="executor",
+                assigned_external_agent="codex",
+                status=TaskStatus.RUNNING,
+                metadata={
+                    "work_item_runtime": True,
+                    "delegation_role_session_id": role_session_id,
+                    "delegation_seat_id": "seat-codex-live",
+                },
+            )
+            await store.save_task(task)
+
+            class ScriptedCodexAdapter(CodexAdapter):
+                async def start_process(
+                    self,
+                    cmd: list[str],
+                    workspace_path: str,
+                    extra_env: dict[str, str] | None = None,
+                    task: Task | None = None,
+                    launch_metadata: dict[str, object] | None = None,
+                ) -> asyncio.subprocess.Process:
+                    return await asyncio.create_subprocess_exec(
+                        sys.executable,
+                        "-c",
+                        (
+                            "import json,sys,time\n"
+                            "print(json.dumps({'type':'thread.started','thread_id':'thread-real-codex'}))\n"
+                            "sys.stdout.flush()\n"
+                            "time.sleep(30)\n"
+                        ),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=workspace_path,
+                    )
+
+            broker = ExternalAgentBroker(store, _ApprovalStub())
+            live_adapter = ScriptedCodexAdapter()
+            live_adapter.config.run_mode = "exec"
+            run_task = asyncio.create_task(
+                broker.run(live_adapter, task, tmpdir)
+            )
+            state = None
+            for _ in range(200):
+                state = await store.get_role_session_adapter_state(
+                    role_session_id,
+                    "codex",
+                )
+                if state and state.get("resume_session_id"):
+                    break
+                await asyncio.sleep(0.01)
+            assert state is not None
+            self.assertEqual(state["resume_session_id"], "thread-real-codex")
+
+            run_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await run_task
+
+            resume_adapter = CodexAdapter()
+            resumed_task = await store.get_task(task.id)
+            assert resumed_task is not None
+            await broker._restore_session_resume_from_store(
+                resume_adapter,
+                resumed_task,
+            )
+            self.assertEqual(resume_adapter.config.session_mode, "resume")
+            self.assertEqual(resume_adapter.config.session_id, "thread-real-codex")
+            cmd, _metadata = resume_adapter.build_invocation(
+                resumed_task,
+                workspace_path=tmpdir,
+            )
+            self.assertEqual(cmd[1:3], ["exec", "resume"])
+            self.assertIn("thread-real-codex", cmd)
+            self.assertEqual(cmd[-1], "-")
+            await store.close()
+
+    async def test_cleanup_cancellation_terminalizes_checkpoint_provider_token(self) -> None:
+        """A Stop checkpoint's working token cannot outlive a failed process."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            role_session_id = "role-runtime::cleanup-race::executor"
+            await store.save_delegation_role_session(DelegationRoleSession(
+                role_session_id=role_session_id,
+                run_id="cleanup-race",
+                project_id="proj1",
+                role_id="executor",
+                seat_id="seat-cleanup-race",
+            ))
+            task = Task(
+                id="cleanup-race-task",
+                title="Cleanup cancellation race",
+                description="Do not resume a provider thread that later failed.",
+                project_id="proj1",
+                session_id="cleanup-race-child",
+                parent_session_id="cleanup-race-parent",
+                assigned_to="executor",
+                assigned_external_agent="codex",
+                status=TaskStatus.RUNNING,
+                metadata={"delegation_role_session_id": role_session_id},
+            )
+            await store.save_task(task)
+            cleanup_started = asyncio.Event()
+            allow_cleanup = asyncio.Event()
+
+            class CleanupRaceCodexAdapter(CodexAdapter):
+                async def start_process(
+                    self,
+                    cmd: list[str],
+                    workspace_path: str,
+                    extra_env: dict[str, str] | None = None,
+                    task: Task | None = None,
+                    launch_metadata: dict[str, object] | None = None,
+                ) -> asyncio.subprocess.Process:
+                    return await asyncio.create_subprocess_exec(
+                        sys.executable,
+                        "-c",
+                        (
+                            "import json,sys,time\n"
+                            "print(json.dumps({'type':'thread.started','thread_id':'thread-cleanup-race'}))\n"
+                            "sys.stdout.flush()\n"
+                            "time.sleep(.2)\n"
+                            "sys.exit(7)\n"
+                        ),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=workspace_path,
+                    )
+
+                async def cleanup_process(self, proc: asyncio.subprocess.Process) -> None:
+                    cleanup_started.set()
+                    await allow_cleanup.wait()
+                    await super().cleanup_process(proc)
+
+            broker = ExternalAgentBroker(store, _ApprovalStub())
+            live_adapter = CleanupRaceCodexAdapter()
+            run_task = asyncio.create_task(broker.run(live_adapter, task, tmpdir))
+            checkpoint_session = None
+            for _ in range(200):
+                checkpoint_session = await store.get_external_session(
+                    "codex", "proj1", task_id=task.id
+                )
+                if (
+                    checkpoint_session is not None
+                    and checkpoint_session.status == "working"
+                    and checkpoint_session.metadata.get("resume_session_id")
+                    == "thread-cleanup-race"
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            assert checkpoint_session is not None
+            self.assertEqual(checkpoint_session.status, "working")
+
+            await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+            run_task.cancel()
+            await asyncio.sleep(0)
+            allow_cleanup.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await run_task
+
+            terminal_session = await store.get_external_session(
+                "codex", "proj1", task_id=task.id
+            )
+            assert terminal_session is not None
+            self.assertEqual(terminal_session.status, "failed")
+            self.assertGreater(
+                terminal_session.updated_at,
+                checkpoint_session.updated_at,
+            )
+
+            task.metadata.update({
+                "work_item_runtime": True,
+                "external_resume_session_id": "thread-cleanup-race",
+                "external_resume_agent_type": "codex",
+                "external_resume_session_scope_id": "cleanup-race-parent",
+                "external_resume_checkpoint_session_updated_at": (
+                    checkpoint_session.updated_at.isoformat()
+                ),
+                "external_resume_checkpoint_session_status": "working",
+            })
+            engine = OPCEngine()
+            engine.project_id = "proj1"
+            engine.store = store
+            resume_adapter, _resume_metadata = (
+                await engine._configure_external_adapter_for_task(
+                    task,
+                    CodexAdapter(),
+                )
+            )
+            self.assertEqual(resume_adapter.config.session_mode, "new")
+            self.assertEqual(resume_adapter.config.session_id, "")
+            self.assertEqual(
+                task.metadata.get("external_resume_fallback"),
+                "context_replay_provider_terminal",
+            )
             await store.close()
 
     async def test_silent_external_agent_times_out_with_reason(self) -> None:
