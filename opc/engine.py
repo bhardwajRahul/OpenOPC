@@ -665,6 +665,7 @@ class OPCEngine:
             self.approval_engine,
             task_preparer=self._build_external_agent_task,
             communication=self.communication,
+            org_engine=self.org_engine,
         )
         self.secretary = SecretaryService(
             llm=self.llm,
@@ -11191,6 +11192,53 @@ class OPCEngine:
         if callable(reset):
             await reset(tasks, payload=payload)
 
+    def _merge_company_runtime_checkpoint_payload(
+        self,
+        payload: dict[str, Any],
+        supplement: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = copy.deepcopy(payload)
+
+        merged["task_ids"] = list(dict.fromkeys([
+            *list(merged.get("task_ids", []) or []),
+            *list(supplement.get("task_ids", []) or []),
+        ]))
+        for key, identity_key in (
+            ("task_snapshots", "task_id"),
+            ("active_work_items", "work_item_id"),
+        ):
+            indexed = {
+                str(item.get(identity_key, "") or "").strip(): copy.deepcopy(item)
+                for item in list(merged.get(key, []) or [])
+                if isinstance(item, dict)
+                and str(item.get(identity_key, "") or "").strip()
+            }
+            for item in list(supplement.get(key, []) or []):
+                if not isinstance(item, dict):
+                    continue
+                identity = str(item.get(identity_key, "") or "").strip()
+                if identity:
+                    indexed[identity] = copy.deepcopy(item)
+            merged[key] = list(indexed.values())
+
+        for key in ("role_runtime_session_ids", "seat_state_ids"):
+            merged[key] = list(dict.fromkeys([
+                *list(merged.get(key, []) or []),
+                *list(supplement.get(key, []) or []),
+            ]))
+        for key in (
+            "native_runtime_resume",
+            "adapter_session_state",
+            "external_sessions",
+            "progress_tail",
+        ):
+            merged[key] = {
+                **dict(merged.get(key, {}) or {}),
+                **copy.deepcopy(dict(supplement.get(key, {}) or {})),
+            }
+        merged["basis_hash"] = self._checkpoint_basis_hash(merged)
+        return merged
+
     async def _load_company_suspend_checkpoint_runtime(
         self,
         checkpoint: ExecutionCheckpoint,
@@ -11213,16 +11261,56 @@ class OPCEngine:
             task = await self.store.get_task(task_id)
             if task:
                 tasks.append(task)
-        if not tasks and parent_session_id:
+
+        plan_data = payload.get("company_work_item_plan") or payload.get("plan") or {}
+        plan = deserialize_company_work_item_runtime_plan(plan_data if isinstance(plan_data, dict) else {})
+        if parent_session_id:
             snapshot = await self._load_company_runtime_snapshot(parent_session_id)
             if snapshot:
-                _plan, tasks = snapshot
+                snapshot_plan, current_tasks = snapshot
+                if not tasks:
+                    tasks = current_tasks
+                    if not plan.projections:
+                        plan = snapshot_plan
+                else:
+                    known_task_ids = {task.id for task in tasks}
+                    held_task_ids = await self._company_suspend_resume_candidate_task_ids(
+                        current_tasks
+                    )
+                    supplemental_tasks = [
+                        task
+                        for task in current_tasks
+                        if task.id not in known_task_ids and task.id in held_task_ids
+                    ]
+                    if supplemental_tasks:
+                        supplement = await self._company_runtime_checkpoint_payload(
+                            checkpoint_type=str(
+                                checkpoint.checkpoint_type
+                                or payload.get("checkpoint_type")
+                                or "company_runtime_interrupted"
+                            ),
+                            reason=str(payload.get("reason", "") or "runtime_resume_reconciliation"),
+                            parent_session_id=parent_session_id,
+                            origin_task_id=str(
+                                checkpoint.task_id
+                                or payload.get("origin_task_id")
+                                or ""
+                            ).strip()
+                            or None,
+                            plan=plan,
+                            tasks=supplemental_tasks,
+                            stop_intent_id=str(payload.get("stop_intent_id", "") or "").strip()
+                            or None,
+                        )
+                        payload = self._merge_company_runtime_checkpoint_payload(
+                            payload,
+                            supplement,
+                        )
+                        tasks.extend(supplemental_tasks)
         if not tasks:
             await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="invalid")
             return None
 
-        plan_data = payload.get("company_work_item_plan") or payload.get("plan") or {}
-        plan = deserialize_company_work_item_runtime_plan(plan_data if isinstance(plan_data, dict) else {})
         payload["checkpoint_id"] = checkpoint.checkpoint_id
         payload["checkpoint_type"] = checkpoint.checkpoint_type
         return payload, parent_session_id, plan, tasks

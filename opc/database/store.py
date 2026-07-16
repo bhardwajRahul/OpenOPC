@@ -3952,6 +3952,23 @@ class OPCStore:
                 current = {}
             if token_record is None:
                 current.pop(agent, None)
+                legacy_agent = str(
+                    current.get("external_resume_agent_type")
+                    or (
+                        current.get("selected_execution_agent")
+                        if current.get("external_resume_session_id")
+                        else ""
+                    )
+                    or ""
+                ).strip()
+                if legacy_agent == agent:
+                    for key in (
+                        "external_resume_session_id",
+                        "external_resume_session_scope_id",
+                        "external_resume_agent_type",
+                        "resume_source_session",
+                    ):
+                        current.pop(key, None)
             else:
                 current[agent] = {
                     str(k): v for k, v in dict(token_record).items()
