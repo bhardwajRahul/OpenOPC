@@ -6363,6 +6363,81 @@ class OPCEngine:
                     f"company runtime resume checkpoint has no task identity snapshot for {task.id}"
                 )
             identity = self._checkpoint_task_execution_identity(task_snapshot)
+            # Resume availability gate: the checkpoint pins one exact
+            # execution backend, so a pinned external agent that is disabled
+            # (or whose binary vanished) makes this work item deterministically
+            # un-runnable — every dispatch would claim, transition to RUNNING,
+            # and crash on the selector's availability check. Fail the item
+            # closed HERE, before any pin/claim, with a visible diagnostic;
+            # the rest of the organization resumes normally and the failed-
+            # child settlement machinery hands the card to manager triage.
+            pinned_agent = str(
+                identity.get("selected_execution_agent", "") or "native"
+            ).strip() or "native"
+            work_item_already_terminal = bool(
+                work_item is not None
+                and getattr(work_item, "phase", None) in DONE_PHASES
+            )
+            # A missing adapter registry means availability is UNKNOWN (engine
+            # not fully initialized / delegate context) — fail open and let the
+            # dispatch-time selector guard decide; only a registry that exists
+            # and excludes the pinned agent is proof of unavailability.
+            if (
+                pinned_agent != "native"
+                and not work_item_already_terminal
+                and self.adapter_registry is not None
+                and pinned_agent not in self._available_external_agents()
+            ):
+                diagnostic = (
+                    f"Cannot resume work item: its execution is pinned to external agent "
+                    f"'{pinned_agent}', which is currently disabled or unavailable. "
+                    f"Re-enable '{pinned_agent}' in the config and restart to run it, "
+                    "or re-issue the work as a new request."
+                )
+                task.metadata = dict(task.metadata or {})
+                for key in _COMPANY_RUNTIME_CONTROL_METADATA_KEYS:
+                    task.metadata.pop(key, None)
+                progress = list(task.metadata.get("progress_log", []) or [])
+                progress.append(diagnostic)
+                task.metadata["progress_log"] = progress[-20:]
+                task.metadata["resume_unavailable_external_agent"] = pinned_agent
+                existing_result = dict(task.result or {})
+                existing_result["content"] = diagnostic
+                task.result = existing_result
+                await self._fail_task_via_phase(
+                    task,
+                    reason="resume_external_agent_unavailable",
+                )
+                if work_item_id and callable(update_work_item):
+                    try:
+                        await update_work_item(
+                            work_item_id,
+                            blocked_reason=diagnostic,
+                            metadata_updates={"dispatch_hold": ""},
+                        )
+                    except Exception:
+                        logger.opt(exception=True).debug(
+                            "company runtime resume: blocked_reason write failed for {}",
+                            work_item_id,
+                        )
+                if self.on_progress:
+                    try:
+                        await self.on_progress(
+                            f"[Company:{projection_id_for_task(task) or task.title}] {diagnostic}"
+                        )
+                    except Exception:
+                        logger.opt(exception=True).debug(
+                            "company runtime resume: unavailable-agent progress emit failed"
+                        )
+                logger.warning(
+                    "company runtime resume: failed work item {} closed — pinned external "
+                    "agent {!r} unavailable",
+                    work_item_id or task.id,
+                    pinned_agent,
+                )
+                fresh = await self.store.get_task(task.id)
+                refreshed.append(fresh or task)
+                continue
             expected_role_session_id = str(
                 identity.get("role_runtime_session_id", "") or ""
             ).strip()
