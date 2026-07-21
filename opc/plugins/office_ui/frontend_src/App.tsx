@@ -1449,6 +1449,56 @@ export default function App() {
           scheduleSessionDetailRefresh(payload.task_id)
         }
       },
+      onRuntimeStatusSync: (payload) => {
+        if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, false)) return
+        const ss = sessionStoreRef.current
+        const bs = boardStoreRef.current
+        if (!ss) return
+        // Periodic reconciliation against the backend's authoritative status.
+        // Diff before dispatching: a tick where nothing drifted must not
+        // trigger a single store update (and therefore no re-render).
+        for (const entry of payload.sessions ?? []) {
+          const taskId = String(entry.task_id ?? '').trim()
+          if (!taskId) continue
+          const session = ss.sessions.find((s) => s.taskId === taskId)
+          if (!session) continue
+          const status = String(entry.status ?? '').trim()
+          const patch: Partial<import('./types/kanban').Session> = {}
+          if (status && status !== session.status) patch.status = status
+          const rawAgentStatus = typeof entry.agent_status === 'string' ? entry.agent_status.trim() : ''
+          if (rawAgentStatus === 'idle' || rawAgentStatus === 'reflecting' || rawAgentStatus === 'tool_active') {
+            if (rawAgentStatus !== session.agentStatus) patch.agentStatus = rawAgentStatus
+            const tool = typeof entry.current_tool === 'string' && entry.current_tool.trim()
+              ? entry.current_tool
+              : undefined
+            if (tool !== session.currentTool) patch.currentTool = tool
+            if (runtimeStatusClearsDisplayTool(rawAgentStatus) && session.displayTool !== undefined) {
+              patch.displayTool = undefined
+            }
+          } else {
+            // No live tracker for this task: only clear stale indicators when
+            // the backend says the task is no longer running (mirrors the
+            // mergeLiveRuntimeField semantics used by collab_sync).
+            const controlActive = session.runtimeControlState === 'running'
+              || session.runtimeControlState === 'suspending'
+              || session.runtimeControlState === 'resuming'
+            if (status && status !== 'running' && !controlActive) {
+              if (session.agentStatus !== undefined) patch.agentStatus = undefined
+              if (session.currentTool !== undefined) patch.currentTool = undefined
+              if (session.displayTool !== undefined) patch.displayTool = undefined
+            }
+          }
+          if (Object.keys(patch).length === 0) continue
+          ss.updateSession(taskId, patch)
+          if (bs && ('agentStatus' in patch || 'currentTool' in patch || 'displayTool' in patch)) {
+            const boardPatch: Partial<KanbanTask> = {}
+            if ('agentStatus' in patch) boardPatch.agentStatus = patch.agentStatus as KanbanTask['agentStatus']
+            if ('currentTool' in patch) boardPatch.currentTool = patch.currentTool
+            if ('displayTool' in patch) boardPatch.displayTool = patch.displayTool
+            bs.updateTask(taskId, boardPatch)
+          }
+        }
+      },
       onWorkerNotification: (payload) => {
         if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, false)) return
         const data = payload as Record<string, unknown>
