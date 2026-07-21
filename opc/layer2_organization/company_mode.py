@@ -5661,7 +5661,18 @@ class CompanyWorkItemExecutor:
                     await self._emit_progress(f"[Company:{projection_id}] awaiting peer", task_id=task.id)
                     await self.save_task(task)
                 else:
+                    await transition_work_item_from_task(
+                        self.store,
+                        task,
+                        target_status_or_phase=result.status,
+                        reason=f"work_item_{result.status.value}",
+                    )
+                    await self._append_progress(
+                        task,
+                        f"Work item ended with status {result.status.value}.",
+                    )
                     await self._emit_progress(f"[Company:{projection_id}] failed", task_id=task.id)
+                    await self.save_task(task)
                 return result
 
             # Comms park check: if the agent sent any blocking messages
@@ -7532,12 +7543,19 @@ class CompanyWorkItemExecutor:
             metadata_updates["review_resolution"] = copy.deepcopy(resolution)
             metadata_updates["review_resolution_state"] = "pending"
         try:
+            current = None
+            if hasattr(self.store, "get_delegation_work_item"):
+                current = await self.store.get_delegation_work_item(review_work_item_id)
+            update_kwargs: dict[str, Any] = {
+                "claimed_by_role_runtime_session_id": "",
+                "claimed_by_seat_id": "",
+                "metadata_updates": metadata_updates,
+            }
+            if current is None or current.phase not in DONE_PHASES or current.phase == phase:
+                update_kwargs["phase"] = phase
             persisted = await self.store.update_delegation_work_item(
                 review_work_item_id,
-                phase=phase,
-                claimed_by_role_runtime_session_id="",
-                claimed_by_seat_id="",
-                metadata_updates=metadata_updates,
+                **update_kwargs,
             )
         except Exception:
             logger.opt(exception=True).warning(
